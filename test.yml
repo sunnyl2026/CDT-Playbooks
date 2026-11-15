@@ -1,0 +1,14 @@
+---
+- name: AWX connectivity test
+  hosts: all
+  gather_facts: false
+
+  tasks:
+    - name: Check hostname
+      ansible.builtin.command: hostname
+      register: hostname_output
+      changed_when: false
+
+    - name: Display hostname
+      ansible.builtin.debug:
+        var: hostname_output.stdout
