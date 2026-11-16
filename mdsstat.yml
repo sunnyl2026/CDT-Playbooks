@@ -1,0 +1,14 @@
+---
+- name: Check Point MDS Status
+  hosts: all
+  gather_facts: false
+
+  tasks:
+    - name: Run mdsstat
+      ansible.builtin.raw: mdsstat
+      register: mdsstat_output
+      changed_when: false
+
+    - name: Display mdsstat output
+      ansible.builtin.debug:
+        var: mdsstat_output.stdout_lines
