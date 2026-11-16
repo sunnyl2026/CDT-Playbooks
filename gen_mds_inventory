@@ -1,0 +1,84 @@
+---
+- name: Collect Check Point MDS inventory
+  hosts: all
+  gather_facts: false
+
+  vars:
+    inventory_dir: /var/log/CDT_Project/Inventory/mds_inventory
+    inventory_file: /var/log/CDT_Project/Inventory/mds_inventory/mds_inventory
+
+  tasks:
+
+    - name: Create MDS inventory directory
+      ansible.builtin.raw: |
+        mkdir -p {{ inventory_dir }}
+      changed_when: false
+
+    - name: Run mdsstat
+      ansible.builtin.raw: |
+        mdsstat
+      register: mdsstat_result
+      changed_when: false
+
+    - name: Display mdsstat output
+      ansible.builtin.debug:
+        var: mdsstat_result.stdout_lines
+
+    - name: Extract CMA name and IP from mdsstat
+      ansible.builtin.set_fact:
+        cma_lines: >-
+          {{
+            mdsstat_result.stdout_lines
+            | select('search', '^\| CMA')
+            | map('regex_replace',
+                  '^\|\s*CMA\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|.*$',
+                  '\1 \2')
+            | map('trim')
+            | list
+          }}
+
+    - name: Display extracted CMA inventory
+      ansible.builtin.debug:
+        var: cma_lines
+
+    - name: Validate CMA inventory is not empty
+      ansible.builtin.assert:
+        that:
+          - cma_lines | length > 0
+        fail_msg: "No CMA entries were extracted from mdsstat. Existing inventory will not be overwritten."
+
+    - name: Write temporary MDS inventory
+      ansible.builtin.raw: |
+        cat > {{ inventory_file }}.tmp <<'EOF'
+        {{ cma_lines | join('\n') }}
+        EOF
+      changed_when: true
+
+    - name: Replace MDS inventory atomically
+      ansible.builtin.raw: |
+        mv {{ inventory_file }}.tmp {{ inventory_file }}
+        chmod 0644 {{ inventory_file }}
+      changed_when: true
+
+    - name: Build structured CMA list
+      ansible.builtin.set_fact:
+        cma_list: >-
+          {{
+            (cma_list | default([]))
+            +
+            [{
+              'name': item.split()[0],
+              'ip': item.split()[1]
+            }]
+          }}
+      loop: "{{ cma_lines }}"
+
+    - name: Display structured CMA list
+      ansible.builtin.debug:
+        var: cma_list
+
+    - name: Save CMA list as AWX artifact
+      ansible.builtin.set_stats:
+        data:
+          cma_list: "{{ cma_list }}"
+        per_host: false
