@@ -25,7 +25,7 @@
     awx_controller_url: "http://172.20.50.28:30080"
 
     # Target Job Template that receives the CMA survey.
-    target_job_template_id: 11
+    target_job_template_id: 13
 
     # Injected by the custom AWX API Token credential.
     awx_oauth_token: >-
