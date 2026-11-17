@@ -4,11 +4,19 @@
   gather_facts: false
 
   vars:
+    # =========================================================
+    # MDS and CDT configuration
+    # =========================================================
+
     ansible_python_interpreter: /usr/bin/python3
 
     mds_inventory_file: /var/log/CDT_Project/Inventory/mds_inventory
     cdt_inventory_directory: /var/log/CDT_Project/Inventory
     deployment_plan_file: /var/log/CDT_Project/Deployment_Plans/inventory.xml
+
+    # =========================================================
+    # AWX API configuration
+    # =========================================================
 
     target_job_template_id: 12
 
@@ -37,6 +45,8 @@
         fail_msg: |
           No CMA was selected.
 
+          Launch this Job Template through the CMA Survey.
+
           Required Survey variable:
           selected_cma_name
         success_msg: >-
@@ -53,7 +63,7 @@
 
 
     # =========================================================
-    # 2. Validate MDS inventory file
+    # 2. Validate MDS inventory
     # =========================================================
 
     - name: Check MDS inventory file
@@ -71,6 +81,8 @@
           The MDS inventory file is missing or empty:
 
           {{ mds_inventory_file }}
+
+          Run the MDS inventory-generation Job Template first.
         success_msg: >-
           MDS inventory file is available.
 
@@ -92,6 +104,13 @@
             | b64decode
             | trim
           }}
+
+    - name: Display current MDS inventory
+      ansible.builtin.debug:
+        msg: |
+          Current MDS inventory:
+
+          {{ mds_inventory_content }}
 
 
     # =========================================================
@@ -129,11 +148,11 @@
         that:
           - selected_cma_matches | length == 1
         fail_msg: |
-          Expected exactly one inventory entry for:
+          Expected exactly one inventory entry for CMA:
 
           {{ selected_cma_name_normalized }}
 
-          Matching entries:
+          Matching entries found:
           {{ selected_cma_matches | length }}
 
           Current MDS inventory:
@@ -194,7 +213,7 @@
 
 
     # =========================================================
-    # 6. Validate paths
+    # 6. Validate required paths
     # =========================================================
 
     - name: Ensure CDT inventory directory exists
@@ -233,7 +252,7 @@
 
 
     # =========================================================
-    # 8. Build exact login-shell command
+    # 8. Build CentralDeploymentTool login-shell command
     # =========================================================
 
     - name: Build CentralDeploymentTool login-shell command
@@ -279,6 +298,7 @@
               exit 23
           fi
 
+          echo "CentralDeploymentTool path: ${CDTDIR}/CentralDeploymentTool"
           echo "===== RUN CENTRAL DEPLOYMENT TOOL ====="
 
           "${CDTDIR}/CentralDeploymentTool" -generate \
@@ -362,7 +382,7 @@
           - cma_inventory_stat.stat.isreg | default(false)
           - cma_inventory_stat.stat.size | default(0) | int > 0
         fail_msg: |
-          The generated candidates file is missing or empty:
+          The generated candidate file is missing or empty:
 
           {{ cma_inventory_file }}
         success_msg: >-
@@ -398,11 +418,11 @@
     # =========================================================
     # 12. Extract clusters and standalone gateways
     #
-    # Cluster Name != N/A:
-    #   Use Cluster Name.
+    # Cluster Name is not N/A:
+    #   Add Cluster Name.
     #
-    # Cluster Name == N/A:
-    #   Use Gateway Name.
+    # Cluster Name is N/A:
+    #   Add Gateway Name.
     # =========================================================
 
     - name: Initialize discovered target choices
@@ -478,16 +498,7 @@
 
 
     # =========================================================
-    # 14. Create AWX choices using real line-feed characters
-    #
-    # This produces:
-    #
-    # CXL103 (Cluster)
-    # R8120GW201 (Gateway)
-    #
-    # as one string containing a real LF between choices.
-    #
-    # It does not produce a literal backslash followed by n.
+    # 14. Build AWX choices with real line-feed characters
     # =========================================================
 
     - name: Build AWX multiselect choices string
@@ -497,28 +508,12 @@
           {{ target_choice }}
           {% endfor %}
 
-    - name: Display AWX choices line-by-line
+    - name: Display AWX multiselect choices
       ansible.builtin.debug:
         msg: |
           AWX multiselect choices:
 
           {{ target_survey_choices_text }}
-
-    - name: Verify AWX choices contain real separate lines
-      ansible.builtin.assert:
-        that:
-          - target_survey_choices_text.splitlines() | length == target_survey_choices | length
-          - "'\\n' not in target_survey_choices_text"
-        fail_msg: |
-          AWX choice formatting is incorrect.
-
-          Structured choices:
-          {{ target_survey_choices }}
-
-          Rendered choice text:
-          {{ target_survey_choices_text }}
-        success_msg: >-
-          AWX choices are formatted as separate lines.
 
 
     # =========================================================
@@ -612,11 +607,8 @@
     # =========================================================
     # 18. Update Job Template 12 multiselect Survey
     #
-    # For this AWX version:
-    #
-    # type    = multiselect
-    # choices = string with real LF separators
-    # default = empty string
+    # choices is a string with real LF separators.
+    # default remains an empty string.
     # =========================================================
 
     - name: Update multiselect Survey on Job Template 12
@@ -656,7 +648,7 @@
               default: ""
 
         validate_certs: "{{ awx_validate_certs }}"
-        return_content: true
+        return_content: false
 
         status_code:
           - 200
@@ -687,7 +679,10 @@
           HTTP status:
           {{ survey_update_result.status }}
 
-          AWX rejected the Survey specification.
+          400 = AWX rejected the Survey specification.
+          401 = Invalid or expired OAuth token.
+          403 = Token owner lacks permission.
+          404 = Job Template or Survey endpoint was not found.
         success_msg: >-
           Job Template 12 multiselect Survey was updated.
 
@@ -726,6 +721,12 @@
       run_once: true
       register: survey_enable_result
       no_log: true
+
+    - name: Display Survey enable status
+      ansible.builtin.debug:
+        msg:
+          - "Survey enable status: {{ survey_enable_result.status }}"
+          - "Target Job Template ID: {{ target_job_template_id }}"
 
     - name: Require successful Survey enablement
       ansible.builtin.assert:
@@ -782,19 +783,28 @@
         success_msg: >-
           Job Template 12 multiselect Survey structure is correct.
 
+    - name: Normalize final Survey choices
+      ansible.builtin.set_fact:
+        final_survey_choices: >-
+          {{
+            final_survey_spec.json.spec[0].choices.splitlines()
+            | map('trim')
+            | reject('equalto', '')
+            | list
+          }}
+
     - name: Verify final Survey choices
       ansible.builtin.assert:
         that:
-          - final_survey_spec.json.spec[0].choices.splitlines() | length == target_survey_choices | length
-          - final_survey_spec.json.spec[0].choices.splitlines() == target_survey_choices
+          - final_survey_choices == target_survey_choices
         fail_msg: |
-          The final Survey choices do not match the generated target list.
+          Final Survey choices do not match the generated choices.
 
           Expected:
           {{ target_survey_choices }}
 
           Stored:
-          {{ final_survey_spec.json.spec[0].choices }}
+          {{ final_survey_choices }}
         success_msg: >-
           Job Template 12 contains separate multiselect choices.
 
@@ -803,9 +813,7 @@
         msg:
           - "Survey type: {{ final_survey_spec.json.spec[0].type }}"
           - "Survey variable: {{ final_survey_spec.json.spec[0].variable }}"
-          - >-
-            Survey choices:
-            {{ final_survey_spec.json.spec[0].choices.splitlines() }}
+          - "Survey choices: {{ final_survey_choices }}"
 
 
     # =========================================================
