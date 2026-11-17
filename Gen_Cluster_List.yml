@@ -186,15 +186,6 @@
           - "CMA name: {{ selected_cma.name }}"
           - "CMA IP: {{ selected_cma.ip }}"
 
-    # This makes selected_cma_name available to downstream
-    # Job Templates in the same AWX Workflow.
-    - name: Publish selected CMA name to AWX workflow artifacts
-      ansible.builtin.set_stats:
-        data:
-          selected_cma_name: "{{ selected_cma.name }}"
-        per_host: false
-      run_once: true
-
 
     # =========================================================
     # 5. Define CentralDeploymentTool values
@@ -428,10 +419,10 @@
     # 12. Extract clusters and standalone gateways
     #
     # Cluster Name is not N/A:
-    #   Add Cluster Name.
+    #   Add "CMA :: Cluster Name (Cluster)".
     #
     # Cluster Name is N/A:
-    #   Add Gateway Name.
+    #   Add "CMA :: Gateway Name (Gateway)".
     # =========================================================
 
     - name: Initialize discovered target choices
@@ -446,7 +437,9 @@
             +
             [
               (
-                (item.split(',')[1] | trim)
+                selected_cma.name
+                ~ ' :: '
+                ~ (item.split(',')[1] | trim)
                 ~ ' (Cluster)'
               )
               if (
@@ -456,7 +449,9 @@
               ) != 'N/A'
               else
               (
-                (item.split(',')[0] | trim)
+                selected_cma.name
+                ~ ' :: '
+                ~ (item.split(',')[0] | trim)
                 ~ ' (Gateway)'
               )
             ]
@@ -871,5 +866,3 @@
           - "Job ID type: Text"
           - "Job ID variable: job_id"
           - "Job ID required: true"
-          - "Workflow artifact: selected_cma_name={{ selected_cma.name }}"
-
