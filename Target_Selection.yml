@@ -1,6 +1,6 @@
 ---
 - name: Save selected CDT targets by Job ID
-  hosts: mds
+  hosts: all
   gather_facts: false
   become: true
 
