@@ -11,19 +11,16 @@
     ansible_python_interpreter: /usr/bin/python3
 
     mds_inventory_file: /var/log/CDT_Project/Inventory/mds_inventory
-
     cdt_inventory_directory: /var/log/CDT_Project/Inventory
-
     deployment_plan_file: /var/log/CDT_Project/Deployment_Plans/inventory.xml
 
     # =========================================================
     # AWX API configuration
     # =========================================================
 
-    # Job Template that receives the Cluster/Gateway Survey.
     target_job_template_id: 12
 
-    # Same proven configuration used by the working CMA playbook.
+    # Confirmed AWX NodePort endpoint.
     awx_controller_url: "http://172.20.50.28:30080"
 
     # Injected by the existing AWX API Token credential.
@@ -39,7 +36,7 @@
   tasks:
 
     # =========================================================
-    # 1. Validate the selected CMA
+    # 1. Validate selected CMA
     # =========================================================
 
     - name: Require selected CMA name
@@ -53,7 +50,6 @@
           Launch this Job Template through the CMA Survey.
 
           Required Survey variable:
-
           selected_cma_name
         success_msg: >-
           Selected CMA: {{ selected_cma_name }}
@@ -69,7 +65,7 @@
 
 
     # =========================================================
-    # 2. Validate the MDS inventory file
+    # 2. Validate MDS inventory
     # =========================================================
 
     - name: Check MDS inventory file
@@ -94,13 +90,7 @@
 
 
     # =========================================================
-    # 3. Read the MDS inventory
-    #
-    # Expected format:
-    #
-    # CMA1_Pri_SMS 172.20.50.31
-    # CMA2_SMS1    172.20.50.41
-    # CMA3_SMS1    172.20.50.42
+    # 3. Read MDS inventory
     # =========================================================
 
     - name: Read MDS inventory file
@@ -126,7 +116,12 @@
 
 
     # =========================================================
-    # 4. Resolve the selected CMA and CMA IP
+    # 4. Resolve selected CMA and IP
+    #
+    # Expected file:
+    #
+    # CMA1_Pri_SMS 172.20.50.31
+    # CMA2_SMS1    172.20.50.41
     # =========================================================
 
     - name: Initialize selected CMA matches
@@ -165,7 +160,6 @@
           {{ selected_cma_name_normalized }}
 
           Matching entries found:
-
           {{ selected_cma_matches | length }}
 
           Current MDS inventory:
@@ -258,10 +252,7 @@
 
 
     # =========================================================
-    # 7. Remove stale candidates file
-    #
-    # This prevents an old inventory file from being accepted
-    # if the new CentralDeploymentTool operation fails.
+    # 7. Remove stale candidate inventory
     # =========================================================
 
     - name: Remove stale CMA candidate inventory
@@ -271,9 +262,9 @@
 
 
     # =========================================================
-    # 8. Build the CentralDeploymentTool login-shell command
+    # 8. Build exact login-shell command
     #
-    # Required commands:
+    # Required:
     #
     # mdsenv CMA_Name
     #
@@ -282,8 +273,6 @@
     #   -candidates=CMA_Name_inventory.csv \
     #   -deploymentplan=inventory.xml \
     #   -server=CMA_IP
-    #
-    # CP.sh is not explicitly sourced.
     # =========================================================
 
     - name: Build CentralDeploymentTool login-shell command
@@ -350,10 +339,7 @@
 
 
     # =========================================================
-    # 9. Run CentralDeploymentTool in a Bash login shell
-    #
-    # argv keeps the complete login-shell script as one argument
-    # following the Bash -c option.
+    # 9. Run CentralDeploymentTool in login shell
     # =========================================================
 
     - name: Generate CMA candidate inventory in login shell
@@ -369,7 +355,7 @@
 
 
     # =========================================================
-    # 10. Display CentralDeploymentTool result
+    # 10. Display CentralDeploymentTool output
     # =========================================================
 
     - name: Display CentralDeploymentTool result
@@ -386,7 +372,7 @@
 
 
     # =========================================================
-    # 11. Require successful candidate generation
+    # 11. Require successful generation
     # =========================================================
 
     - name: Require successful CentralDeploymentTool generation
@@ -424,7 +410,7 @@
 
 
     # =========================================================
-    # 12. Validate the generated candidate inventory
+    # 12. Validate generated candidate inventory
     # =========================================================
 
     - name: Check generated CMA candidate inventory
@@ -448,7 +434,7 @@
 
 
     # =========================================================
-    # 13. Read the CentralDeploymentTool candidate inventory
+    # 13. Read CentralDeploymentTool candidate inventory
     # =========================================================
 
     - name: Read generated CMA candidate inventory
@@ -476,17 +462,13 @@
     # =========================================================
     # 14. Extract cluster and standalone gateway names
     #
-    # Candidate columns:
-    #
-    # Gateway Name, Cluster Name, IP Address, ...
-    #
     # Rules:
     #
     # Cluster Name != N/A:
-    #   Add Cluster Name as Cluster.
+    #   Use Cluster Name.
     #
     # Cluster Name == N/A:
-    #   Add Gateway Name as Gateway.
+    #   Use Gateway Name.
     # =========================================================
 
     - name: Initialize discovered target choices
@@ -529,16 +511,13 @@
     # =========================================================
     # 15. Build unique Survey choices
     #
-    # Example input:
+    # Example result:
     #
-    # GW101,      CXL103, 172.20.50.101, ...
-    # GW102,      CXL103, 172.20.50.102, ...
-    # R8120GW201, N/A,    172.20.50.201, ...
+    # target_survey_choices:
+    #   - CXL103 (Cluster)
+    #   - R8120GW201 (Gateway)
     #
-    # Result:
-    #
-    # CXL103 (Cluster)
-    # R8120GW201 (Gateway)
+    # Keep this as a list. Do not join it into a text string.
     # =========================================================
 
     - name: Build unique sorted target choices
@@ -567,14 +546,6 @@
         success_msg: >-
           Extracted {{ target_survey_choices | length }}
           unique target choices.
-
-    - name: Build newline-delimited Survey choices
-      ansible.builtin.set_fact:
-        target_survey_choices_text: >-
-          {{
-            target_survey_choices
-            | join('\n')
-          }}
 
     - name: Display target Survey choices
       ansible.builtin.debug:
@@ -605,14 +576,14 @@
         fail_msg: |
           AWX API configuration is incomplete.
 
-          Check the hard-coded AWX controller URL and confirm that
-          the AWX API Token credential is attached to this Job Template.
+          Check the AWX controller URL and confirm that the
+          AWX API Token credential is attached to this Job Template.
         success_msg: >-
           AWX API configuration is available.
 
 
     # =========================================================
-    # 17. Test the AWX API root
+    # 17. Test AWX API root
     # =========================================================
 
     - name: Test AWX API root
@@ -635,7 +606,7 @@
 
 
     # =========================================================
-    # 18. Verify authenticated access to Job Template 12
+    # 18. Verify access to Job Template 12
     # =========================================================
 
     - name: Check authenticated access to Job Template 12
@@ -685,11 +656,16 @@
     # =========================================================
     # 19. Update Job Template 12 multiselect Survey
     #
-    # This operation replaces the existing Survey specification.
+    # IMPORTANT:
     #
-    # Job Template 12 receives:
+    # choices is sent as an actual JSON list:
     #
-    # selected_target_choices
+    # [
+    #   "CXL103 (Cluster)",
+    #   "R8120GW201 (Gateway)"
+    # ]
+    #
+    # Do not convert the list into a newline-delimited string.
     # =========================================================
 
     - name: Update multiselect Survey on Job Template 12
@@ -714,8 +690,8 @@
               required: true
               type: "multiselect"
               variable: "selected_target_choices"
-              choices: "{{ target_survey_choices_text }}"
-              default: ""
+              choices: "{{ target_survey_choices }}"
+              default: []
         validate_certs: "{{ awx_validate_certs }}"
         return_content: false
         status_code:
@@ -755,7 +731,7 @@
 
 
     # =========================================================
-    # 20. Enable the Survey
+    # 20. Enable Survey on Job Template 12
     # =========================================================
 
     - name: Enable Survey on Job Template 12
@@ -801,7 +777,7 @@
 
 
     # =========================================================
-    # 21. Verify the completed Survey
+    # 21. Verify final Survey
     # =========================================================
 
     - name: Retrieve final Survey specification
@@ -821,7 +797,7 @@
       changed_when: false
       no_log: true
 
-    - name: Verify final Survey specification
+    - name: Verify final Survey structure
       ansible.builtin.assert:
         that:
           - final_survey_spec.json is defined
@@ -830,15 +806,26 @@
           - final_survey_spec.json.spec[0].variable == 'selected_target_choices'
           - final_survey_spec.json.spec[0].type == 'multiselect'
           - final_survey_spec.json.spec[0].required | bool
-        fail_msg: >-
-          Job Template 12 does not contain the expected required
-          selected_target_choices multiselect Survey.
+          - final_survey_spec.json.spec[0].choices is iterable
+          - final_survey_spec.json.spec[0].choices is not string
+          - final_survey_spec.json.spec[0].choices | length == target_survey_choices | length
+        fail_msg: |
+          Job Template 12 does not contain the expected
+          selected_target_choices multiselect Survey with separate
+          selectable choices.
         success_msg: >-
-          Job Template 12 multiselect Survey is correct.
+          Job Template 12 multiselect Survey structure is correct.
+
+    - name: Display verified Survey choices
+      ansible.builtin.debug:
+        msg:
+          - "Survey type: {{ final_survey_spec.json.spec[0].type }}"
+          - "Survey variable: {{ final_survey_spec.json.spec[0].variable }}"
+          - "Survey choices: {{ final_survey_spec.json.spec[0].choices }}"
 
 
     # =========================================================
-    # 22. Final result
+    # 22. Final summary
     # =========================================================
 
     - name: Display final summary
@@ -849,5 +836,6 @@
           - "CMA IP: {{ selected_cma.ip }}"
           - "Candidates file: {{ cma_inventory_file }}"
           - "Target Job Template ID: {{ target_job_template_id }}"
+          - "Survey type: Multiple Choice (multiple select)"
           - "Survey variable: selected_target_choices"
           - "Survey choices: {{ target_survey_choices }}"
