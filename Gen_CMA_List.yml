@@ -1,5 +1,5 @@
 ---
-- name: Generate MDS CMA inventory and refresh AWX Job Template survey
+- name: Generate MDS CMA inventory and refresh AWX CMA survey
   hosts: all
   gather_facts: false
 
@@ -17,25 +17,17 @@
     # AWX configuration
     # =========================================================
 
-    # IMPORTANT:
-    # Replace this with the exact AWX origin shown in the
-    # browser, including the correct protocol and port.
+    # Confirmed from:
+    # kubectl get svc -n awx
     #
-    # Examples:
-    # http://172.20.50.28
-    # http://172.20.50.28:30080
-    # https://awx.example.local
-    #
-    # Do not include:
-    # /#/templates/...
-    # /api/v2/
-    # a trailing slash
-    awx_controller_url: "http://172.20.50.28"
+    # awx-service:
+    # NodePort 80:30080/TCP
+    awx_controller_url: "http://172.20.50.28:30080"
 
-    # The Job Template that will receive the CMA survey.
+    # Target Job Template that receives the CMA survey.
     target_job_template_id: 11
 
-    # Injected by the custom "AWX API Token" credential.
+    # Injected by the custom AWX API Token credential.
     awx_oauth_token: >-
       {{
         lookup('ansible.builtin.env', 'AWX_OAUTH_TOKEN')
@@ -43,7 +35,8 @@
         | trim
       }}
 
-    # Use false for a self-signed AWX certificate.
+    # HTTP is currently used, so certificate validation has no effect.
+    # Keep false if HTTPS with a self-signed certificate is used later.
     awx_validate_certs: false
 
   tasks:
@@ -73,9 +66,9 @@
 
 
     # =========================================================
-    # 3. Initialize the structured CMA inventory
+    # 3. Initialize structured CMA inventory
     #
-    # Final structure:
+    # Expected result:
     #
     # cma_inventory:
     #   - name: CMA1_Pri_SMS
@@ -90,7 +83,7 @@
 
 
     # =========================================================
-    # 4. Extract CMA name and IP from mdsstat
+    # 4. Parse CMA rows from mdsstat
     #
     # Source:
     #
@@ -127,7 +120,7 @@
 
 
     # =========================================================
-    # 5. Verify that at least one CMA was found
+    # 5. Confirm at least one CMA was found
     # =========================================================
 
     - name: Verify CMA entries were discovered
@@ -142,7 +135,7 @@
 
 
     # =========================================================
-    # 6. Validate each CMA entry
+    # 6. Validate every CMA entry
     # =========================================================
 
     - name: Validate each CMA entry
@@ -153,7 +146,6 @@
           - item.name | trim | length > 0
           - item.ip is match('^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
         fail_msg: "Invalid CMA entry: {{ item }}"
-        success_msg: "Valid CMA entry: {{ item.name }} {{ item.ip }}"
         quiet: true
       loop: "{{ cma_inventory }}"
       loop_control:
@@ -161,7 +153,7 @@
 
 
     # =========================================================
-    # 7. Display the structured CMA inventory
+    # 7. Display structured inventory
     # =========================================================
 
     - name: Display structured CMA inventory
@@ -170,7 +162,7 @@
 
 
     # =========================================================
-    # 8. Initialize text lines for the MDS inventory file
+    # 8. Initialize text lines for mds_inventory
     # =========================================================
 
     - name: Initialize MDS inventory file lines
@@ -179,7 +171,7 @@
 
 
     # =========================================================
-    # 9. Build the inventory file lines
+    # 9. Build text inventory lines
     #
     # Result:
     #
@@ -203,7 +195,7 @@
 
 
     # =========================================================
-    # 10. Ensure the parent Inventory directory exists
+    # 10. Ensure the parent directory exists
     # =========================================================
 
     - name: Ensure CDT Inventory directory exists
@@ -224,13 +216,13 @@
 
 
     # =========================================================
-    # 12. Remove the old incorrectly created directory
+    # 12. Remove the old incorrect directory
     #
-    # Removes:
+    # This removes:
     #
     # /var/log/CDT_Project/Inventory/mds_inventory/
     #
-    # only when mds_inventory is a directory.
+    # only if mds_inventory is currently a directory.
     # =========================================================
 
     - name: Remove old incorrect mds_inventory directory
@@ -266,7 +258,7 @@
 
 
     # =========================================================
-    # 15. Verify that mds_inventory is a regular file
+    # 15. Ensure mds_inventory is a regular file
     # =========================================================
 
     - name: Verify generated inventory is a regular file
@@ -306,7 +298,7 @@
 
 
     # =========================================================
-    # 18. Verify the generated file content
+    # 18. Verify generated file content
     # =========================================================
 
     - name: Verify generated inventory content
@@ -314,7 +306,7 @@
         that:
           - generated_inventory_content == (mds_inventory_lines | join('\n'))
         fail_msg: |
-          Generated inventory file does not match the discovered CMA data.
+          Generated inventory file does not match the CMA data.
 
           Expected:
           {{ mds_inventory_lines | join('\n') }}
@@ -326,12 +318,12 @@
 
 
     # =========================================================
-    # 19. Build sorted CMA survey choices
+    # 19. Build sorted, unique Survey choices
     #
-    # Only the CMA name appears in the dropdown.
+    # Only CMA names appear in the dropdown.
     # =========================================================
 
-    - name: Build sorted CMA survey choices
+    - name: Build sorted CMA Survey choices
       ansible.builtin.set_fact:
         cma_survey_names: >-
           {{
@@ -344,7 +336,7 @@
 
 
     # =========================================================
-    # 20. Display survey choices
+    # 20. Display Survey choices
     # =========================================================
 
     - name: Display CMA Survey choices
@@ -355,9 +347,9 @@
 
 
     # =========================================================
-    # 21. Safely display API configuration status
+    # 21. Display safe API configuration
     #
-    # The token value is never displayed.
+    # The OAuth token value is never displayed.
     # =========================================================
 
     - name: Display safe AWX API configuration status
@@ -370,7 +362,7 @@
 
 
     # =========================================================
-    # 22. Validate the AWX API settings
+    # 22. Validate AWX API configuration
     # =========================================================
 
     - name: Validate AWX API configuration
@@ -382,20 +374,17 @@
           - awx_oauth_token | length > 0
           - cma_survey_names | length > 0
         fail_msg: >-
-          AWX API configuration is incomplete. Verify the exact AWX
-          controller URL, Job Template ID 11, and the AWX API Token
-          credential attached to this Job Template.
+          AWX API configuration is incomplete. Verify the AWX
+          controller URL, Job Template ID 11, and the attached
+          AWX API Token credential.
         success_msg: >-
           AWX API configuration validated successfully.
 
 
     # =========================================================
-    # 23. Test the AWX API root
+    # 23. Test the confirmed AWX API root
     #
-    # Accept 200 and 404 so a useful explanation can be shown
-    # without hiding the actual response.
-    #
-    # This request contains no OAuth token.
+    # This request contains no token.
     # =========================================================
 
     - name: Test AWX API root
@@ -404,7 +393,7 @@
         method: GET
         validate_certs: "{{ awx_validate_certs }}"
         follow_redirects: safe
-        return_content: true
+        return_content: false
         status_code:
           - 200
           - 301
@@ -417,7 +406,7 @@
 
 
     # =========================================================
-    # 24. Display API root result
+    # 24. Display API-root result
     # =========================================================
 
     - name: Display AWX API root result
@@ -431,12 +420,12 @@
               'AWX API root found'
               if awx_api_root_test.status | int == 200
               else
-              'AWX API root not found at this controller URL'
+              'AWX API root was not found'
             }}
 
 
     # =========================================================
-    # 25. Fail clearly when the controller URL is incorrect
+    # 25. Verify the API root is valid
     # =========================================================
 
     - name: Verify AWX API root was found
@@ -444,33 +433,26 @@
         that:
           - awx_api_root_test.status | int == 200
         fail_msg: |
-          The AWX service is reachable, but the API was not found at:
+          The AWX API was not found at:
 
           {{ awx_controller_url }}/api/v2/
 
-          HTTP status:
-          {{ awx_api_root_test.status }}
+          HTTP status: {{ awx_api_root_test.status }}
 
-          This usually means awx_controller_url has the wrong protocol,
-          port, hostname, or ingress address.
+          The expected controller URL is:
 
-          Set awx_controller_url to the exact AWX browser origin.
-
-          Examples:
-
-          http://172.20.50.28
           http://172.20.50.28:30080
-          https://awx.example.local
-
-          Do not include "/#/templates/..." or "/api/v2/" in the variable.
         success_msg: >-
           AWX API root is reachable.
 
 
     # =========================================================
-    # 26. Test authenticated access to Job Template 11
+    # 26. Check authenticated access to Job Template 11
     #
     # no_log protects the Authorization header.
+    #
+    # Common HTTP statuses are accepted so the following tasks
+    # can display a sanitized result.
     # =========================================================
 
     - name: Check authenticated access to Job Template 11
@@ -497,7 +479,7 @@
 
 
     # =========================================================
-    # 27. Show sanitized authenticated API status
+    # 27. Display sanitized authentication result
     # =========================================================
 
     - name: Display authenticated Job Template API status
@@ -515,7 +497,7 @@
 
 
     # =========================================================
-    # 28. Verify Job Template 11 is accessible
+    # 28. Verify authenticated access
     # =========================================================
 
     - name: Verify authenticated access to Job Template 11
@@ -525,24 +507,23 @@
         fail_msg: |
           Unable to access AWX Job Template 11.
 
-          HTTP status:
-          {{ target_job_template_test.status }}
+          HTTP status: {{ target_job_template_test.status }}
 
           401 = OAuth token is invalid or expired.
-          403 = OAuth token user lacks permission.
+          403 = Token owner lacks permission.
           404 = Job Template ID 11 does not exist or is not visible.
         success_msg: >-
           Authenticated access to Job Template 11 succeeded.
 
 
     # =========================================================
-    # 29. Update the survey on Job Template 11
+    # 29. Create or replace the Survey on Job Template 11
     #
-    # multiplechoice allows one selection.
+    # multiplechoice provides a single-selection choice.
     #
-    # The selected value is provided to the target playbook as:
+    # Job Template 11 receives:
     #
-    # selected_cma_name
+    # selected_cma_name: CMA1_Pri_SMS
     # =========================================================
 
     - name: Update CMA Survey on Job Template 11
@@ -585,7 +566,7 @@
 
 
     # =========================================================
-    # 30. Display sanitized survey update status
+    # 30. Display sanitized Survey-update result
     # =========================================================
 
     - name: Display CMA Survey update status
@@ -596,7 +577,7 @@
 
 
     # =========================================================
-    # 31. Verify that the survey update succeeded
+    # 31. Verify Survey update
     # =========================================================
 
     - name: Verify CMA Survey update succeeded
@@ -606,19 +587,18 @@
         fail_msg: |
           Updating the CMA Survey failed.
 
-          HTTP status:
-          {{ survey_update_result.status }}
+          HTTP status: {{ survey_update_result.status }}
 
           400 = Survey specification is invalid.
           401 = OAuth token is invalid or expired.
-          403 = OAuth token user lacks permission.
+          403 = Token owner lacks permission.
           404 = Job Template or Survey endpoint was not found.
         success_msg: >-
           CMA Survey was updated successfully on Job Template 11.
 
 
     # =========================================================
-    # 32. Enable the survey on Job Template 11
+    # 32. Enable the Survey on Job Template 11
     # =========================================================
 
     - name: Enable Survey on Job Template 11
@@ -649,7 +629,7 @@
 
 
     # =========================================================
-    # 33. Display sanitized survey enable status
+    # 33. Display sanitized Survey-enable result
     # =========================================================
 
     - name: Display Survey enable status
@@ -660,7 +640,7 @@
 
 
     # =========================================================
-    # 34. Verify the survey was enabled
+    # 34. Verify Survey was enabled
     # =========================================================
 
     - name: Verify Survey was enabled
@@ -675,7 +655,7 @@
 
 
     # =========================================================
-    # 35. Read the final Survey specification
+    # 35. Retrieve final Survey specification
     # =========================================================
 
     - name: Retrieve final Survey specification
@@ -702,40 +682,57 @@
 
 
     # =========================================================
-    # 36. Verify the final Survey is accessible
+    # 36. Verify final Survey is accessible
     # =========================================================
 
-    - name: Verify final Survey specification
+    - name: Verify final Survey specification is accessible
       ansible.builtin.assert:
         that:
           - final_survey_spec.status | int == 200
         fail_msg: >-
-          The Survey update completed, but reading the final Survey
+          The Survey update completed, but Survey verification
           failed with HTTP status {{ final_survey_spec.status }}.
         success_msg: >-
           Final Survey specification is accessible.
 
 
     # =========================================================
-    # 37. Verify the final Survey content
+    # 37. Verify the final Survey question
     # =========================================================
 
     - name: Verify final CMA Survey content
       ansible.builtin.assert:
         that:
+          - final_survey_spec.json is defined
           - final_survey_spec.json.spec is defined
           - final_survey_spec.json.spec | length > 0
           - final_survey_spec.json.spec[0].variable == 'selected_cma_name'
           - final_survey_spec.json.spec[0].type == 'multiplechoice'
+          - final_survey_spec.json.spec[0].required | bool
         fail_msg: >-
-          The final Survey does not contain the expected
+          The final Survey does not contain the expected required
           selected_cma_name multiple-choice question.
         success_msg: >-
           The final CMA Survey content is correct.
 
 
     # =========================================================
-    # 38. Publish the structured AWX artifact
+    # 38. Publish the structured CMA artifact
+    #
+    # Result:
+    #
+    # {
+    #   "cma_inventory": [
+    #     {
+    #       "name": "CMA1_Pri_SMS",
+    #       "ip": "172.20.50.31"
+    #     },
+    #     {
+    #       "name": "CMA2_SMS1",
+    #       "ip": "172.20.50.41"
+    #     }
+    #   ]
+    # }
     # =========================================================
 
     - name: Publish structured CMA inventory artifact
@@ -746,7 +743,7 @@
 
 
     # =========================================================
-    # 39. Display the final result
+    # 39. Display final result
     # =========================================================
 
     - name: Display final result
