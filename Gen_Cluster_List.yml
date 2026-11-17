@@ -17,33 +17,16 @@
     deployment_plan_file: /var/log/CDT_Project/Deployment_Plans/inventory.xml
 
     # =========================================================
-    # Target AWX Job Template
+    # AWX API configuration
     # =========================================================
 
+    # Job Template that receives the Cluster/Gateway Survey.
     target_job_template_id: 12
 
-    # =========================================================
-    # AWX API configuration
-    #
-    # Injected by the custom AWX API credential:
-    #
-    # AWX_CONTROLLER_URL
-    # AWX_OAUTH_TOKEN
-    # =========================================================
+    # Same proven configuration used by the working CMA playbook.
+    awx_controller_url: "http://172.20.50.28:30080"
 
-    awx_controller_url_raw: >-
-      {{
-        lookup('ansible.builtin.env', 'AWX_CONTROLLER_URL')
-        | default('', true)
-        | trim
-      }}
-
-    awx_controller_url: >-
-      {{
-        awx_controller_url_raw
-        | regex_replace('/+$', '')
-      }}
-
+    # Injected by the existing AWX API Token credential.
     awx_oauth_token: >-
       {{
         lookup('ansible.builtin.env', 'AWX_OAUTH_TOKEN')
@@ -67,7 +50,7 @@
         fail_msg: |
           No CMA was selected.
 
-          Launch this Job Template through the AWX CMA Survey.
+          Launch this Job Template through the CMA Survey.
 
           Required Survey variable:
 
@@ -143,10 +126,7 @@
 
 
     # =========================================================
-    # 4. Find the selected CMA and its IP
-    #
-    # Exact field comparison is used.
-    # No regular expression is used for the CMA-name lookup.
+    # 4. Resolve the selected CMA and CMA IP
     # =========================================================
 
     - name: Initialize selected CMA matches
@@ -184,15 +164,17 @@
 
           {{ selected_cma_name_normalized }}
 
-          Matches found:
+          Matching entries found:
 
           {{ selected_cma_matches | length }}
 
           Current MDS inventory:
 
           {{ mds_inventory_content }}
+
+          Regenerate the MDS inventory and refresh the CMA Survey.
         success_msg: >-
-          Found one inventory entry for
+          Found exactly one entry for
           {{ selected_cma_name_normalized }}.
 
     - name: Set selected CMA information
@@ -206,7 +188,7 @@
         that:
           - selected_cma.ip is match('^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
         fail_msg: |
-          Invalid IP address for CMA {{ selected_cma.name }}:
+          Invalid IP address for {{ selected_cma.name }}:
 
           {{ selected_cma.ip }}
         success_msg: >-
@@ -222,14 +204,6 @@
 
     # =========================================================
     # 5. Define CentralDeploymentTool values
-    #
-    # Example:
-    #
-    # Session:
-    # CMA2_SMS1_session
-    #
-    # Candidates:
-    # /var/log/CDT_Project/Inventory/CMA2_SMS1_inventory.csv
     # =========================================================
 
     - name: Define CentralDeploymentTool values
@@ -254,7 +228,7 @@
 
 
     # =========================================================
-    # 6. Validate required local paths
+    # 6. Validate required paths
     # =========================================================
 
     - name: Ensure CDT inventory directory exists
@@ -284,10 +258,10 @@
 
 
     # =========================================================
-    # 7. Remove any stale candidates file
+    # 7. Remove stale candidates file
     #
-    # This prevents an old file from being accepted when the
-    # current CentralDeploymentTool command fails.
+    # This prevents an old inventory file from being accepted
+    # if the new CentralDeploymentTool operation fails.
     # =========================================================
 
     - name: Remove stale CMA candidate inventory
@@ -297,9 +271,9 @@
 
 
     # =========================================================
-    # 8. Build the required login-shell command
+    # 8. Build the CentralDeploymentTool login-shell command
     #
-    # The login shell must run:
+    # Required commands:
     #
     # mdsenv CMA_Name
     #
@@ -353,7 +327,7 @@
           fi
 
           if [ ! -x "${CDTDIR}/CentralDeploymentTool" ]; then
-              echo "ERROR: CentralDeploymentTool does not exist or is not executable:" >&2
+              echo "ERROR: CentralDeploymentTool is missing or not executable:" >&2
               echo "${CDTDIR}/CentralDeploymentTool" >&2
               exit 23
           fi
@@ -376,9 +350,10 @@
 
 
     # =========================================================
-    # 9. Run the command in a real Bash login shell
+    # 9. Run CentralDeploymentTool in a Bash login shell
     #
-    # argv keeps the complete command as one argument after -c.
+    # argv keeps the complete login-shell script as one argument
+    # following the Bash -c option.
     # =========================================================
 
     - name: Generate CMA candidate inventory in login shell
@@ -394,7 +369,7 @@
 
 
     # =========================================================
-    # 10. Display full CentralDeploymentTool output
+    # 10. Display CentralDeploymentTool result
     # =========================================================
 
     - name: Display CentralDeploymentTool result
@@ -411,7 +386,7 @@
 
 
     # =========================================================
-    # 11. Require successful generation
+    # 11. Require successful candidate generation
     # =========================================================
 
     - name: Require successful CentralDeploymentTool generation
@@ -449,7 +424,7 @@
 
 
     # =========================================================
-    # 12. Validate the generated candidates file
+    # 12. Validate the generated candidate inventory
     # =========================================================
 
     - name: Check generated CMA candidate inventory
@@ -473,7 +448,7 @@
 
 
     # =========================================================
-    # 13. Read the tool-generated candidates file
+    # 13. Read the CentralDeploymentTool candidate inventory
     # =========================================================
 
     - name: Read generated CMA candidate inventory
@@ -499,22 +474,18 @@
 
 
     # =========================================================
-    # 14. Extract clusters and standalone gateways
+    # 14. Extract cluster and standalone gateway names
     #
-    # CDT candidate rows:
+    # Candidate columns:
     #
     # Gateway Name, Cluster Name, IP Address, ...
     #
-    # GW101,      CXL103, 172.20.50.101, ...
-    # GW102,      CXL103, 172.20.50.102, ...
-    # R8120GW201, N/A,    172.20.50.201, ...
-    #
     # Rules:
     #
-    # Cluster Name is not N/A:
+    # Cluster Name != N/A:
     #   Add Cluster Name as Cluster.
     #
-    # Cluster Name is N/A:
+    # Cluster Name == N/A:
     #   Add Gateway Name as Gateway.
     # =========================================================
 
@@ -556,18 +527,18 @@
 
 
     # =========================================================
-    # 15. Remove duplicate cluster entries
+    # 15. Build unique Survey choices
     #
-    # Example:
+    # Example input:
     #
-    # GW101 -> CXL103
-    # GW102 -> CXL103
+    # GW101,      CXL103, 172.20.50.101, ...
+    # GW102,      CXL103, 172.20.50.102, ...
+    # R8120GW201, N/A,    172.20.50.201, ...
     #
-    # Survey result:
+    # Result:
     #
     # CXL103 (Cluster)
-    #
-    # only once.
+    # R8120GW201 (Gateway)
     # =========================================================
 
     - name: Build unique sorted target choices
@@ -616,7 +587,8 @@
     # =========================================================
     # 16. Validate AWX API configuration
     # =========================================================
-    - name: Display AWX API credential injection status
+
+    - name: Display AWX API credential status
       ansible.builtin.debug:
         msg:
           - "AWX Controller URL: {{ awx_controller_url }}"
@@ -626,32 +598,21 @@
     - name: Validate AWX API configuration
       ansible.builtin.assert:
         that:
-          - awx_controller_url | length > 0
+          - awx_controller_url | trim | length > 0
+          - not awx_controller_url.endswith('/')
           - awx_oauth_token | length > 0
           - target_job_template_id | int == 12
         fail_msg: |
           AWX API configuration is incomplete.
 
-          Confirm that the AWX API credential is attached and
-          injects:
-
-          AWX_CONTROLLER_URL
-          AWX_OAUTH_TOKEN
+          Check the hard-coded AWX controller URL and confirm that
+          the AWX API Token credential is attached to this Job Template.
         success_msg: >-
           AWX API configuration is available.
 
-    - name: Display safe AWX API settings
-      ansible.builtin.debug:
-        msg:
-          - "AWX controller: {{ awx_controller_url }}"
-          - "Target Job Template ID: {{ target_job_template_id }}"
-          - >-
-            OAuth token available:
-            {{ (awx_oauth_token | length > 0) | bool }}
-
 
     # =========================================================
-    # 17. Test the AWX API endpoint
+    # 17. Test the AWX API root
     # =========================================================
 
     - name: Test AWX API root
@@ -674,7 +635,7 @@
 
 
     # =========================================================
-    # 18. Verify access to Job Template 12
+    # 18. Verify authenticated access to Job Template 12
     # =========================================================
 
     - name: Check authenticated access to Job Template 12
@@ -724,10 +685,7 @@
     # =========================================================
     # 19. Update Job Template 12 multiselect Survey
     #
-    # Choices:
-    #
-    # CXL103 (Cluster)
-    # R8120GW201 (Gateway)
+    # This operation replaces the existing Survey specification.
     #
     # Job Template 12 receives:
     #
@@ -880,7 +838,7 @@
 
 
     # =========================================================
-    # 22. Display final result
+    # 22. Final result
     # =========================================================
 
     - name: Display final summary
