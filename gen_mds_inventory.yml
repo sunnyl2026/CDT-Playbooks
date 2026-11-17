@@ -4,14 +4,14 @@
   gather_facts: false
 
   vars:
-    inventory_dir: "/var/log/CDT_Project/Inventory"
+    inventory_directory: "/var/log/CDT_Project/Inventory"
     inventory_file: "/var/log/CDT_Project/Inventory/mds_inventory"
 
   tasks:
 
-    # ---------------------------------------------------------
-    # Run mdsstat
-    # ---------------------------------------------------------
+    # =========================================================
+    # 1. Run mdsstat once
+    # =========================================================
 
     - name: Run mdsstat
       ansible.builtin.shell: |
@@ -21,131 +21,94 @@
         executable: /bin/bash
       register: mdsstat_output
       changed_when: false
+      failed_when: mdsstat_output.rc != 0
 
     - name: Display mdsstat output
       ansible.builtin.debug:
         var: mdsstat_output.stdout_lines
 
 
-    # ---------------------------------------------------------
-    # Extract CMA name and IP
+    # =========================================================
+    # 2. Parse CMA name and IP address
     #
-    # Expected final format:
+    # Actual mdsstat format:
+    #
+    # | CMA | CMA1_Pri_SMS | 172.20.50.31 | up ... |
+    #
+    # Required output:
     #
     # CMA1_Pri_SMS 172.20.50.31
     # CMA2_SMS1 172.20.50.41
-    # ---------------------------------------------------------
+    # =========================================================
 
     - name: Extract CMA name and IP from mdsstat
       ansible.builtin.shell: |
-        source /etc/profile.d/CP.sh
-        mdsstat | awk '
-        /^[[:space:]]*\|/ {
-            gsub(/^[[:space:]]*\|[[:space:]]*/, "", $0)
-            gsub(/[[:space:]]*\|[[:space:]]*$/, "", $0)
+        awk -F'|' '
+          {
+            type = $2
+            name = $3
+            ip   = $4
 
-            n = split($0, a, "|")
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", type)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", ip)
 
-            for (i = 1; i <= n; i++) {
-                gsub(/^[[:space:]]+|[[:space:]]+$/, "", a[i])
+            if (
+              type == "CMA" &&
+              name != "" &&
+              ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/
+            ) {
+              print name, ip
             }
-
-            if (a[1] ~ /^CMA/ && a[2] ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
-                print a[1], a[2]
-            }
-        }'
+          }
+        '
       args:
         executable: /bin/bash
+        stdin: "{{ mdsstat_output.stdout }}"
       register: cma_inventory
       changed_when: false
 
+    - name: Display extracted CMA inventory
+      ansible.builtin.debug:
+        var: cma_inventory.stdout_lines
 
-    # ---------------------------------------------------------
-    # Verify that something was extracted
-    # ---------------------------------------------------------
 
-    - name: Fail if no CMA was found
+    # =========================================================
+    # 3. Validate the extracted CMA information
+    # =========================================================
+
+    - name: Fail if no CMA was extracted
       ansible.builtin.fail:
-        msg: "No CMA information could be extracted from mdsstat."
-      when: cma_inventory.stdout | trim == ""
+        msg: |
+          No CMA information could be extracted from mdsstat.
+
+          Review the mdsstat output shown earlier in this AWX job.
+      when: cma_inventory.stdout | trim | length == 0
 
 
-    # ---------------------------------------------------------
-    # Create parent directory ONLY
-    # ---------------------------------------------------------
+    # =========================================================
+    # 4. Ensure only the parent Inventory directory exists
+    #
+    # Correct structure:
+    #
+    # /var/log/CDT_Project/Inventory/
+    # └── mds_inventory
+    #
+    # "mds_inventory" must be a file, not a directory.
+    # =========================================================
 
-    - name: Ensure CDT Inventory directory exists
+    - name: Ensure CDT Inventory parent directory exists
       ansible.builtin.file:
-        path: "{{ inventory_dir }}"
+        path: "{{ inventory_directory }}"
         state: directory
         mode: "0755"
 
 
-    # ---------------------------------------------------------
-    # Handle old incorrect mds_inventory directory
-    #
-    # This is needed because the previous playbook created:
-    #
-    # /var/log/CDT_Project/Inventory/mds_inventory/
-    #
-    # We now want mds_inventory to be a FILE.
-    # ---------------------------------------------------------
+    # =========================================================
+    # 5. Detect the existing mds_inventory path
+    # =========================================================
 
     - name: Check existing mds_inventory path
       ansible.builtin.stat:
         path: "{{ inventory_file }}"
-      register: old_inventory_path
-
-    - name: Remove old mds_inventory directory if it exists
-      ansible.builtin.file:
-        path: "{{ inventory_file }}"
-        state: absent
-      when:
-        - old_inventory_path.stat.exists
-        - old_inventory_path.stat.isdir | default(false)
-
-
-    # ---------------------------------------------------------
-    # Write inventory file to MDS
-    # ---------------------------------------------------------
-
-    - name: Write MDS inventory file
-      ansible.builtin.copy:
-        content: "{{ cma_inventory.stdout | trim }}\n"
-        dest: "{{ inventory_file }}"
-        mode: "0644"
-
-
-    # ---------------------------------------------------------
-    # Read back file for verification
-    # ---------------------------------------------------------
-
-    - name: Read generated MDS inventory
-      ansible.builtin.command:
-        cmd: "cat {{ inventory_file }}"
-      register: generated_inventory
-      changed_when: false
-
-
-    - name: Display generated MDS inventory
-      ansible.builtin.debug:
-        msg: |
-          MDS inventory successfully generated:
-
-          {{ generated_inventory.stdout }}
-
-          File location:
-          {{ inventory_file }}
-
-
-    # ---------------------------------------------------------
-    # Store CMA information as AWX Artifact
-    # ---------------------------------------------------------
-
-    - name: Store MDS inventory as AWX artifact
-      ansible.builtin.set_stats:
-        data:
-          mds_inventory: "{{ generated_inventory.stdout }}"
-          mds_inventory_file: "{{ inventory_file }}"
-          cma_list: "{{ generated_inventory.stdout_lines }}"
-        per_host: false
+      register
