@@ -186,6 +186,15 @@
           - "CMA name: {{ selected_cma.name }}"
           - "CMA IP: {{ selected_cma.ip }}"
 
+    # This makes selected_cma_name available to downstream
+    # Job Templates in the same AWX Workflow.
+    - name: Publish selected CMA name to AWX workflow artifacts
+      ansible.builtin.set_stats:
+        data:
+          selected_cma_name: "{{ selected_cma.name }}"
+        per_host: false
+      run_once: true
+
 
     # =========================================================
     # 5. Define CentralDeploymentTool values
@@ -569,16 +578,20 @@
         url: >-
           {{ awx_controller_url }}/api/v2/job_templates/{{ target_job_template_id }}/
         method: GET
+
         headers:
-          Authorization: "Bearer {{ awx_oauth_token }}"
+          Authorization: "{{ ['Bearer', awx_oauth_token] | join(' ') }}"
           Accept: "application/json"
+
         validate_certs: "{{ awx_validate_certs }}"
         return_content: false
+
         status_code:
           - 200
           - 401
           - 403
           - 404
+
       delegate_to: localhost
       run_once: true
       register: target_template_test
@@ -605,20 +618,21 @@
 
 
     # =========================================================
-    # 18. Update Job Template 12 multiselect Survey
+    # 18. Update Job Template 12 Survey
     #
-    # choices is a string with real LF separators.
-    # default remains an empty string.
+    # The Survey contains:
+    #   1. Dynamic cluster/gateway multiselect.
+    #   2. Required Job ID text input.
     # =========================================================
 
-    - name: Update multiselect Survey on Job Template 12
+    - name: Update Survey on Job Template 12
       ansible.builtin.uri:
         url: >-
           {{ awx_controller_url }}/api/v2/job_templates/{{ target_job_template_id }}/survey_spec/
         method: POST
 
         headers:
-          Authorization: "Bearer {{ awx_oauth_token }}"
+          Authorization: "{{ ['Bearer', awx_oauth_token] | join(' ') }}"
           Accept: "application/json"
           Content-Type: "application/json"
 
@@ -644,6 +658,19 @@
               variable: "selected_target_choices"
 
               choices: "{{ target_survey_choices_text }}"
+
+              default: ""
+
+            - question_name: "Please Input the Job ID"
+
+              question_description: >-
+                Enter the Job ID for this target selection.
+
+              required: true
+
+              type: "text"
+
+              variable: "job_id"
 
               default: ""
 
@@ -674,7 +701,7 @@
         that:
           - survey_update_result.status | int in [200, 201]
         fail_msg: |
-          Updating the multiselect Survey failed.
+          Updating the Survey failed.
 
           HTTP status:
           {{ survey_update_result.status }}
@@ -684,7 +711,7 @@
           403 = Token owner lacks permission.
           404 = Job Template or Survey endpoint was not found.
         success_msg: >-
-          Job Template 12 multiselect Survey was updated.
+          Job Template 12 Survey was updated.
 
 
     # =========================================================
@@ -698,7 +725,7 @@
         method: PATCH
 
         headers:
-          Authorization: "Bearer {{ awx_oauth_token }}"
+          Authorization: "{{ ['Bearer', awx_oauth_token] | join(' ') }}"
           Accept: "application/json"
           Content-Type: "application/json"
 
@@ -750,7 +777,7 @@
         method: GET
 
         headers:
-          Authorization: "Bearer {{ awx_oauth_token }}"
+          Authorization: "{{ ['Bearer', awx_oauth_token] | join(' ') }}"
           Accept: "application/json"
 
         validate_certs: "{{ awx_validate_certs }}"
@@ -773,15 +800,20 @@
         that:
           - final_survey_spec.json is defined
           - final_survey_spec.json.spec is defined
-          - final_survey_spec.json.spec | length == 1
+          - final_survey_spec.json.spec | length == 2
           - final_survey_spec.json.spec[0].variable == 'selected_target_choices'
           - final_survey_spec.json.spec[0].type == 'multiselect'
           - final_survey_spec.json.spec[0].required | bool
+          - final_survey_spec.json.spec[1].question_name == 'Please Input the Job ID'
+          - final_survey_spec.json.spec[1].variable == 'job_id'
+          - final_survey_spec.json.spec[1].type == 'text'
+          - final_survey_spec.json.spec[1].required | bool
+          - final_survey_spec.json.spec[1].default == ''
         fail_msg: >-
-          Job Template 12 does not contain the expected
-          selected_target_choices multiselect Survey.
+          Job Template 12 does not contain the expected required
+          selected_target_choices multiselect and job_id text items.
         success_msg: >-
-          Job Template 12 multiselect Survey structure is correct.
+          Job Template 12 Survey structure is correct.
 
     - name: Normalize final Survey choices
       ansible.builtin.set_fact:
@@ -808,12 +840,16 @@
         success_msg: >-
           Job Template 12 contains separate multiselect choices.
 
-    - name: Display verified Survey choices
+    - name: Display verified Survey items
       ansible.builtin.debug:
         msg:
-          - "Survey type: {{ final_survey_spec.json.spec[0].type }}"
-          - "Survey variable: {{ final_survey_spec.json.spec[0].variable }}"
-          - "Survey choices: {{ final_survey_choices }}"
+          - "Target Survey type: {{ final_survey_spec.json.spec[0].type }}"
+          - "Target Survey variable: {{ final_survey_spec.json.spec[0].variable }}"
+          - "Target Survey choices: {{ final_survey_choices }}"
+          - "Job ID question: {{ final_survey_spec.json.spec[1].question_name }}"
+          - "Job ID type: {{ final_survey_spec.json.spec[1].type }}"
+          - "Job ID variable: {{ final_survey_spec.json.spec[1].variable }}"
+          - "Job ID required: {{ final_survey_spec.json.spec[1].required }}"
 
 
     # =========================================================
@@ -831,3 +867,9 @@
           - "Survey type: Multiple Choice (multiple select)"
           - "Survey variable: selected_target_choices"
           - "Survey choices: {{ target_survey_choices }}"
+          - "Job ID question: Please Input the Job ID"
+          - "Job ID type: Text"
+          - "Job ID variable: job_id"
+          - "Job ID required: true"
+          - "Workflow artifact: selected_cma_name={{ selected_cma.name }}"
+
