@@ -4,8 +4,11 @@
   gather_facts: false
 
   vars:
-    inventory_directory: "/var/log/CDT_Project/Inventory"
-    inventory_file: "/var/log/CDT_Project/Inventory/mds_inventory"
+    # Prevent the Python interpreter discovery warning shown in AWX.
+    ansible_python_interpreter: /usr/bin/python3
+
+    inventory_directory: /var/log/CDT_Project/Inventory
+    inventory_file: /var/log/CDT_Project/Inventory/mds_inventory
 
   tasks:
 
@@ -29,52 +32,62 @@
 
 
     # =========================================================
-    # 2. Parse CMA name and IP address
+    # 2. Initialize the CMA inventory list
+    # =========================================================
+
+    - name: Initialize CMA inventory list
+      ansible.builtin.set_fact:
+        cma_inventory_lines: []
+
+
+    # =========================================================
+    # 3. Extract CMA name and IP address
     #
-    # Actual mdsstat format:
-    #
+    # Source line:
     # | CMA | CMA1_Pri_SMS | 172.20.50.31 | up ... |
     #
-    # Required output:
-    #
+    # Result:
     # CMA1_Pri_SMS 172.20.50.31
-    # CMA2_SMS1 172.20.50.41
     # =========================================================
 
     - name: Extract CMA name and IP from mdsstat
-      ansible.builtin.shell: |
-        awk -F'|' '
-          {
-            type = $2
-            name = $3
-            ip   = $4
-
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", type)
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", ip)
-
-            if (
-              type == "CMA" &&
-              name != "" &&
-              ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/
-            ) {
-              print name, ip
-            }
-          }
-        '
-      args:
-        executable: /bin/bash
-        stdin: "{{ mdsstat_output.stdout }}"
-      register: cma_inventory
-      changed_when: false
-
-    - name: Display extracted CMA inventory
-      ansible.builtin.debug:
-        var: cma_inventory.stdout_lines
+      ansible.builtin.set_fact:
+        cma_inventory_lines: >-
+          {{
+            cma_inventory_lines
+            +
+            [
+              item
+              | regex_replace(
+                  '^\|\s*CMA\s*\|\s*([^|]+?)\s*\|\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\s*\|.*$',
+                  '\1 \2'
+                )
+              | trim
+            ]
+          }}
+      loop: >-
+        {{
+          mdsstat_output.stdout_lines
+          | select('match', '^\|\s*CMA\s*\|')
+          | list
+        }}
+      loop_control:
+        label: "{{ item }}"
 
 
     # =========================================================
-    # 3. Validate the extracted CMA information
+    # 4. Display extracted entries
+    # =========================================================
+
+    - name: Display extracted CMA inventory
+      ansible.builtin.debug:
+        msg:
+          - "CMA count: {{ cma_inventory_lines | length }}"
+          - "CMA entries: {{ cma_inventory_lines }}"
+
+
+    # =========================================================
+    # 5. Validate CMA extraction
     # =========================================================
 
     - name: Fail if no CMA was extracted
@@ -82,19 +95,38 @@
         msg: |
           No CMA information could be extracted from mdsstat.
 
-          Review the mdsstat output shown earlier in this AWX job.
-      when: cma_inventory.stdout | trim | length == 0
+          Expected an mdsstat row similar to:
+
+          | CMA | CMA1_Pri_SMS | 172.20.50.31 | up ... |
+      when: cma_inventory_lines | length == 0
 
 
     # =========================================================
-    # 4. Ensure only the parent Inventory directory exists
+    # 6. Validate every extracted entry
     #
-    # Correct structure:
+    # Required format:
+    # CMA_NAME IPv4_ADDRESS
+    # =========================================================
+
+    - name: Validate extracted CMA entries
+      ansible.builtin.assert:
+        that:
+          - item is match('^\S+\s+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+        fail_msg: "Invalid CMA inventory entry: {{ item }}"
+        success_msg: "Valid CMA inventory entry: {{ item }}"
+      loop: "{{ cma_inventory_lines }}"
+      loop_control:
+        label: "{{ item }}"
+
+
+    # =========================================================
+    # 7. Ensure only the parent Inventory directory exists
     #
-    # /var/log/CDT_Project/Inventory/
-    # └── mds_inventory
+    # Correct destination:
     #
-    # "mds_inventory" must be a file, not a directory.
+    # /var/log/CDT_Project/Inventory/mds_inventory
+    #
+    # mds_inventory must be a file, not a directory.
     # =========================================================
 
     - name: Ensure CDT Inventory parent directory exists
@@ -105,7 +137,7 @@
 
 
     # =========================================================
-    # 5. Detect the existing mds_inventory path
+    # 8. Check the current mds_inventory path
     # =========================================================
 
     - name: Check existing mds_inventory path
@@ -115,14 +147,14 @@
 
 
     # =========================================================
-    # 6. Remove old incorrect mds_inventory directory
+    # 9. Remove the incorrectly created directory
     #
-    # Removes this incorrect structure:
+    # Old incorrect structure:
     #
     # /var/log/CDT_Project/Inventory/mds_inventory/
     # └── mds_inventory
     #
-    # This task does not remove an existing correct file.
+    # An existing correct regular file is not removed here.
     # =========================================================
 
     - name: Remove old incorrect mds_inventory directory
@@ -135,20 +167,25 @@
 
 
     # =========================================================
-    # 7. Write the correct mds_inventory file
+    # 10. Write the inventory file
+    #
+    # Expected content:
+    #
+    # CMA1_Pri_SMS 172.20.50.31
+    # CMA2_SMS1 172.20.50.41
     # =========================================================
 
     - name: Write MDS inventory file
       ansible.builtin.copy:
-        content: |
-          {{ cma_inventory.stdout | trim }}
+        content: "{{ cma_inventory_lines | join('\n') ~ '\n' }}"
         dest: "{{ inventory_file }}"
         mode: "0644"
+        force: true
       register: inventory_write_result
 
 
     # =========================================================
-    # 8. Verify that mds_inventory is now a regular file
+    # 11. Confirm that mds_inventory is a regular file
     # =========================================================
 
     - name: Check generated MDS inventory file
@@ -156,17 +193,20 @@
         path: "{{ inventory_file }}"
       register: generated_inventory_stat
 
-    - name: Fail if mds_inventory is not a regular file
-      ansible.builtin.fail:
-        msg: |
+    - name: Verify mds_inventory is a regular file
+      ansible.builtin.assert:
+        that:
+          - generated_inventory_stat.stat.exists | default(false)
+          - generated_inventory_stat.stat.isreg | default(false)
+          - not generated_inventory_stat.stat.isdir | default(false)
+        fail_msg: >-
           {{ inventory_file }} was not created as a regular file.
-      when:
-        - not generated_inventory_stat.stat.exists | default(false) or
-          not generated_inventory_stat.stat.isreg | default(false)
+        success_msg: >-
+          {{ inventory_file }} was created as a regular file.
 
 
     # =========================================================
-    # 9. Read back the generated file
+    # 12. Read the generated file from MDS
     # =========================================================
 
     - name: Read generated MDS inventory file
@@ -174,7 +214,7 @@
         src: "{{ inventory_file }}"
       register: generated_inventory_raw
 
-    - name: Set generated inventory facts
+    - name: Decode generated inventory file
       ansible.builtin.set_fact:
         generated_inventory_content: >-
           {{
@@ -183,31 +223,47 @@
             | trim
           }}
 
-        generated_cma_list: >-
-          {{
-            (
-              generated_inventory_raw.content
-              | b64decode
-              | trim
-            ).splitlines()
-          }}
+
+    # =========================================================
+    # 13. Verify file content matches extracted CMA data
+    # =========================================================
+
+    - name: Verify generated inventory content
+      ansible.builtin.assert:
+        that:
+          - generated_inventory_content == (cma_inventory_lines | join('\n'))
+        fail_msg: |
+          Generated inventory file does not match the extracted CMA data.
+
+          Extracted data:
+          {{ cma_inventory_lines | join('\n') }}
+
+          File content:
+          {{ generated_inventory_content }}
+        success_msg: "Generated inventory file content is correct."
 
 
     # =========================================================
-    # 10. Display final result in AWX output
+    # 14. Display final result in AWX output
     # =========================================================
 
     - name: Display generated MDS inventory
       ansible.builtin.debug:
-        msg:
-          - "MDS inventory generated successfully"
-          - "File: {{ inventory_file }}"
-          - "CMA count: {{ generated_cma_list | length }}"
-          - "CMA entries: {{ generated_cma_list }}"
+        msg: |
+          MDS inventory generated successfully.
+
+          File:
+          {{ inventory_file }}
+
+          CMA count:
+          {{ cma_inventory_lines | length }}
+
+          Content:
+          {{ generated_inventory_content }}
 
 
     # =========================================================
-    # 11. Store results as AWX job artifacts
+    # 15. Publish AWX artifacts
     # =========================================================
 
     - name: Store MDS inventory as AWX artifacts
@@ -215,6 +271,6 @@
         data:
           mds_inventory_file: "{{ inventory_file }}"
           mds_inventory: "{{ generated_inventory_content }}"
-          cma_count: "{{ generated_cma_list | length }}"
-          cma_list: "{{ generated_cma_list }}"
+          cma_count: "{{ cma_inventory_lines | length }}"
+          cma_list: "{{ cma_inventory_lines }}"
         per_host: false
