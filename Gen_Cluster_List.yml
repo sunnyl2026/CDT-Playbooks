@@ -4,11 +4,11 @@
   gather_facts: false
 
   vars:
-    ansible_python_interpreter: /usr/bin/python3
+    # =========================================================
+    # MDS and CDT configuration
+    # =========================================================
 
-    # =========================================================
-    # MDS and CDT paths
-    # =========================================================
+    ansible_python_interpreter: /usr/bin/python3
 
     mds_inventory_file: /var/log/CDT_Project/Inventory/mds_inventory
 
@@ -25,7 +25,7 @@
     # =========================================================
     # AWX API configuration
     #
-    # Supplied by the custom AWX API credential:
+    # Injected by the custom AWX API credential:
     #
     # AWX_CONTROLLER_URL
     # AWX_OAUTH_TOKEN
@@ -56,7 +56,7 @@
   tasks:
 
     # =========================================================
-    # 1. Validate selected CMA from Job Template 11 Survey
+    # 1. Validate the selected CMA
     # =========================================================
 
     - name: Require selected CMA name
@@ -67,7 +67,7 @@
         fail_msg: |
           No CMA was selected.
 
-          Launch this Job Template through the CMA Survey.
+          Launch this Job Template through the AWX CMA Survey.
 
           Required Survey variable:
 
@@ -86,7 +86,7 @@
 
 
     # =========================================================
-    # 2. Validate MDS inventory file
+    # 2. Validate the MDS inventory file
     # =========================================================
 
     - name: Check MDS inventory file
@@ -111,7 +111,7 @@
 
 
     # =========================================================
-    # 3. Read MDS inventory
+    # 3. Read the MDS inventory
     #
     # Expected format:
     #
@@ -134,9 +134,19 @@
             | trim
           }}
 
+    - name: Display current MDS inventory
+      ansible.builtin.debug:
+        msg: |
+          Current MDS inventory:
+
+          {{ mds_inventory_content }}
+
 
     # =========================================================
-    # 4. Find selected CMA and its IP
+    # 4. Find the selected CMA and its IP
+    #
+    # Exact field comparison is used.
+    # No regular expression is used for the CMA-name lookup.
     # =========================================================
 
     - name: Initialize selected CMA matches
@@ -170,7 +180,7 @@
         that:
           - selected_cma_matches | length == 1
         fail_msg: |
-          Expected exactly one entry for CMA:
+          Expected exactly one inventory entry for CMA:
 
           {{ selected_cma_name_normalized }}
 
@@ -182,7 +192,8 @@
 
           {{ mds_inventory_content }}
         success_msg: >-
-          Found one entry for {{ selected_cma_name_normalized }}.
+          Found one inventory entry for
+          {{ selected_cma_name_normalized }}.
 
     - name: Set selected CMA information
       ansible.builtin.set_fact:
@@ -195,7 +206,7 @@
         that:
           - selected_cma.ip is match('^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
         fail_msg: |
-          Invalid IP address for {{ selected_cma.name }}:
+          Invalid IP address for CMA {{ selected_cma.name }}:
 
           {{ selected_cma.ip }}
         success_msg: >-
@@ -210,10 +221,18 @@
 
 
     # =========================================================
-    # 5. Define CDT input and output values
+    # 5. Define CentralDeploymentTool values
+    #
+    # Example:
+    #
+    # Session:
+    # CMA2_SMS1_session
+    #
+    # Candidates:
+    # /var/log/CDT_Project/Inventory/CMA2_SMS1_inventory.csv
     # =========================================================
 
-    - name: Define CDT generation values
+    - name: Define CentralDeploymentTool values
       ansible.builtin.set_fact:
         cdt_session_name: "{{ selected_cma.name }}_session"
 
@@ -225,7 +244,7 @@
             ~ '_inventory.csv'
           }}
 
-    - name: Display CDT generation values
+    - name: Display CentralDeploymentTool values
       ansible.builtin.debug:
         msg:
           - "Session: {{ cdt_session_name }}"
@@ -235,7 +254,7 @@
 
 
     # =========================================================
-    # 6. Validate required output directories and deployment plan
+    # 6. Validate required local paths
     # =========================================================
 
     - name: Ensure CDT inventory directory exists
@@ -256,18 +275,19 @@
           - deployment_plan_stat.stat.isreg | default(false)
           - deployment_plan_stat.stat.size | default(0) | int > 0
         fail_msg: |
-          The required CDT deployment plan is missing or empty:
+          The CentralDeploymentTool deployment plan is missing
+          or empty:
 
           {{ deployment_plan_file }}
         success_msg: >-
-          CDT deployment plan is available.
+          CentralDeploymentTool deployment plan is available.
 
 
     # =========================================================
-    # 7. Remove stale generated inventory
+    # 7. Remove any stale candidates file
     #
-    # This ensures that a failed CDT run cannot leave an old file
-    # that appears to be a successful new result.
+    # This prevents an old file from being accepted when the
+    # current CentralDeploymentTool command fails.
     # =========================================================
 
     - name: Remove stale CMA candidate inventory
@@ -277,17 +297,19 @@
 
 
     # =========================================================
-    # 8. Build exact CentralDeploymentTool login-shell command
+    # 8. Build the required login-shell command
     #
-    # Required operation:
+    # The login shell must run:
     #
     # mdsenv CMA_Name
     #
-    # $CDTDIR/CentralDeploymentTool -generate
-    #   -session=CMA_Name_session
-    #   -candidates=CMA_Name_inventory.csv
-    #   -deploymentplan=inventory.xml
+    # $CDTDIR/CentralDeploymentTool -generate \
+    #   -session=CMA_Name_session \
+    #   -candidates=CMA_Name_inventory.csv \
+    #   -deploymentplan=inventory.xml \
     #   -server=CMA_IP
+    #
+    # CP.sh is not explicitly sourced.
     # =========================================================
 
     - name: Build CentralDeploymentTool login-shell command
@@ -298,27 +320,17 @@
           echo "Selected CMA: {{ selected_cma.name }}"
           echo "Selected CMA IP: {{ selected_cma.ip }}"
 
-          if [ ! -f /etc/profile.d/CP.sh ]; then
-              echo "ERROR: /etc/profile.d/CP.sh was not found" >&2
+          echo "===== VERIFY MDSENV ====="
+
+          if ! command -v mdsenv >/dev/null 2>&1; then
+              echo "ERROR: mdsenv is not available in the login shell" >&2
+              echo "PATH=${PATH}" >&2
               exit 20
           fi
 
-          source /etc/profile.d/CP.sh
-          PROFILE_RC=$?
+          echo "mdsenv path: $(command -v mdsenv)"
 
-          echo "Check Point profile return code: ${PROFILE_RC}"
-
-          if [ "${PROFILE_RC}" -ne 0 ]; then
-              echo "ERROR: Failed to load the Check Point profile" >&2
-              exit 21
-          fi
-
-          if ! command -v mdsenv >/dev/null 2>&1; then
-              echo "ERROR: mdsenv command was not found" >&2
-              exit 22
-          fi
-
-          echo "Switching to CMA: {{ selected_cma.name }}"
+          echo "===== SWITCH TO SELECTED CMA ====="
 
           mdsenv {{ selected_cma.name | quote }}
           MDSENV_RC=$?
@@ -327,25 +339,28 @@
 
           if [ "${MDSENV_RC}" -ne 0 ]; then
               echo "ERROR: mdsenv failed for {{ selected_cma.name }}" >&2
-              exit 23
+              exit 21
           fi
 
+          echo "===== CMA ENVIRONMENT ====="
           echo "FWDIR=${FWDIR:-NOT_SET}"
           echo "MDSDIR=${MDSDIR:-NOT_SET}"
           echo "CDTDIR=${CDTDIR:-NOT_SET}"
 
           if [ -z "${CDTDIR:-}" ]; then
-              echo "ERROR: CDTDIR is not set after loading the login shell" >&2
-              exit 24
+              echo "ERROR: CDTDIR is not defined in the login shell" >&2
+              exit 22
           fi
 
           if [ ! -x "${CDTDIR}/CentralDeploymentTool" ]; then
-              echo "ERROR: CentralDeploymentTool was not found at:" >&2
+              echo "ERROR: CentralDeploymentTool does not exist or is not executable:" >&2
               echo "${CDTDIR}/CentralDeploymentTool" >&2
-              exit 25
+              exit 23
           fi
 
-          echo "===== RUNNING CENTRAL DEPLOYMENT TOOL ====="
+          echo "CentralDeploymentTool path: ${CDTDIR}/CentralDeploymentTool"
+
+          echo "===== RUN CENTRAL DEPLOYMENT TOOL ====="
 
           "${CDTDIR}/CentralDeploymentTool" -generate \
             -session={{ cdt_session_name | quote }} \
@@ -361,10 +376,9 @@
 
 
     # =========================================================
-    # 9. Run CentralDeploymentTool in a real Bash login shell
+    # 9. Run the command in a real Bash login shell
     #
-    # argv keeps the complete command as the single value
-    # following Bash -c.
+    # argv keeps the complete command as one argument after -c.
     # =========================================================
 
     - name: Generate CMA candidate inventory in login shell
@@ -380,7 +394,7 @@
 
 
     # =========================================================
-    # 10. Display CentralDeploymentTool output
+    # 10. Display full CentralDeploymentTool output
     # =========================================================
 
     - name: Display CentralDeploymentTool result
@@ -397,7 +411,7 @@
 
 
     # =========================================================
-    # 11. Require successful CentralDeploymentTool generation
+    # 11. Require successful generation
     # =========================================================
 
     - name: Require successful CentralDeploymentTool generation
@@ -416,6 +430,12 @@
           Session:
           {{ cdt_session_name }}
 
+          Candidates:
+          {{ cma_inventory_file }}
+
+          Deployment plan:
+          {{ deployment_plan_file }}
+
           Return code:
           {{ cdt_generation_result.rc }}
 
@@ -425,11 +445,11 @@
           STDERR:
           {{ cdt_generation_result.stderr | default('') }}
         success_msg: >-
-          CentralDeploymentTool generated the candidate inventory.
+          CentralDeploymentTool generated the CMA candidate inventory.
 
 
     # =========================================================
-    # 12. Validate generated inventory
+    # 12. Validate the generated candidates file
     # =========================================================
 
     - name: Check generated CMA candidate inventory
@@ -444,23 +464,16 @@
           - cma_inventory_stat.stat.isreg | default(false)
           - cma_inventory_stat.stat.size | default(0) | int > 0
         fail_msg: |
-          CentralDeploymentTool completed, but the candidate file
+          CentralDeploymentTool completed, but the candidates file
           is missing or empty:
 
           {{ cma_inventory_file }}
         success_msg: >-
-          Generated candidate inventory is available.
+          Generated CMA candidate inventory is available.
 
 
     # =========================================================
-    # 13. Read generated CentralDeploymentTool inventory
-    #
-    # Relevant table:
-    #
-    # Gateway Name, Cluster Name, IP Address, ...
-    # GW101,        CXL103,       172.20.50.101, ...
-    # GW102,        CXL103,       172.20.50.102, ...
-    # R8120GW201,   N/A,          172.20.50.201, ...
+    # 13. Read the tool-generated candidates file
     # =========================================================
 
     - name: Read generated CMA candidate inventory
@@ -480,33 +493,36 @@
     - name: Display generated CMA candidate inventory
       ansible.builtin.debug:
         msg: |
-          Generated inventory:
+          Generated candidate inventory:
 
           {{ generated_inventory_content }}
 
 
     # =========================================================
-    # 14. Extract cluster names and standalone gateway names
+    # 14. Extract clusters and standalone gateways
+    #
+    # CDT candidate rows:
+    #
+    # Gateway Name, Cluster Name, IP Address, ...
+    #
+    # GW101,      CXL103, 172.20.50.101, ...
+    # GW102,      CXL103, 172.20.50.102, ...
+    # R8120GW201, N/A,    172.20.50.201, ...
     #
     # Rules:
     #
-    # Cluster Name != N/A:
-    #   use Cluster Name once
-    #   type = Cluster
+    # Cluster Name is not N/A:
+    #   Add Cluster Name as Cluster.
     #
-    # Cluster Name == N/A:
-    #   use Gateway Name
-    #   type = Gateway
-    #
-    # A valid candidate row is identified by an IPv4 address in
-    # the third comma-separated field.
+    # Cluster Name is N/A:
+    #   Add Gateway Name as Gateway.
     # =========================================================
 
     - name: Initialize discovered target choices
       ansible.builtin.set_fact:
         discovered_target_choices: []
 
-    - name: Extract target choices from CDT candidate inventory
+    - name: Extract cluster and gateway choices
       ansible.builtin.set_fact:
         discovered_target_choices: >-
           {{
@@ -514,15 +530,17 @@
             +
             [
               (
-                item.split(',')[1] | trim
+                (item.split(',')[1] | trim)
                 ~ ' (Cluster)'
               )
               if (
-                item.split(',')[1] | trim | upper
+                item.split(',')[1]
+                | trim
+                | upper
               ) != 'N/A'
               else
               (
-                item.split(',')[0] | trim
+                (item.split(',')[0] | trim)
                 ~ ' (Gateway)'
               )
             ]
@@ -532,15 +550,20 @@
         label: "{{ item }}"
       when:
         - item.split(',') | length >= 3
-        - item.split(',')[2] | trim is match('^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
         - item.split(',')[0] | trim | length > 0
         - item.split(',')[1] | trim | length > 0
+        - item.split(',')[2] | trim is match('^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
 
 
     # =========================================================
-    # 15. Remove duplicate cluster names
+    # 15. Remove duplicate cluster entries
     #
-    # GW101 and GW102 both belong to CXL103, so the Survey gets:
+    # Example:
+    #
+    # GW101 -> CXL103
+    # GW102 -> CXL103
+    #
+    # Survey result:
     #
     # CXL103 (Cluster)
     #
@@ -562,11 +585,12 @@
         that:
           - target_survey_choices | length > 0
         fail_msg: |
-          No clusters or standalone gateways were extracted from:
+          No cluster or standalone gateway choices were extracted
+          from:
 
           {{ cma_inventory_file }}
 
-          Generated inventory:
+          Generated candidate inventory:
 
           {{ generated_inventory_content }}
         success_msg: >-
@@ -602,23 +626,26 @@
         fail_msg: |
           AWX API configuration is incomplete.
 
-          Confirm the attached AWX API credential injects:
+          Confirm that the AWX API credential is attached and
+          injects:
 
           AWX_CONTROLLER_URL
           AWX_OAUTH_TOKEN
         success_msg: >-
           AWX API configuration is available.
 
-    - name: Display safe AWX API configuration
+    - name: Display safe AWX API settings
       ansible.builtin.debug:
         msg:
           - "AWX controller: {{ awx_controller_url }}"
           - "Target Job Template ID: {{ target_job_template_id }}"
-          - "OAuth token available: {{ (awx_oauth_token | length > 0) | bool }}"
+          - >-
+            OAuth token available:
+            {{ (awx_oauth_token | length > 0) | bool }}
 
 
     # =========================================================
-    # 17. Test AWX API
+    # 17. Test the AWX API endpoint
     # =========================================================
 
     - name: Test AWX API root
@@ -633,9 +660,15 @@
       register: awx_api_test
       changed_when: false
 
+    - name: Display AWX API result
+      ansible.builtin.debug:
+        msg:
+          - "AWX API status: {{ awx_api_test.status }}"
+          - "AWX controller: {{ awx_controller_url }}"
+
 
     # =========================================================
-    # 18. Verify Job Template 12 access
+    # 18. Verify access to Job Template 12
     # =========================================================
 
     - name: Check authenticated access to Job Template 12
@@ -685,12 +718,12 @@
     # =========================================================
     # 19. Update Job Template 12 multiselect Survey
     #
-    # Survey choices:
+    # Choices:
     #
     # CXL103 (Cluster)
     # R8120GW201 (Gateway)
     #
-    # The Survey variable presented to Job Template 12 is:
+    # Job Template 12 receives:
     #
     # selected_target_choices
     # =========================================================
@@ -758,7 +791,7 @@
 
 
     # =========================================================
-    # 20. Enable Survey on Job Template 12
+    # 20. Enable the Survey
     # =========================================================
 
     - name: Enable Survey on Job Template 12
@@ -786,6 +819,12 @@
       register: survey_enable_result
       no_log: true
 
+    - name: Display Survey enable status
+      ansible.builtin.debug:
+        msg:
+          - "Survey enable status: {{ survey_enable_result.status }}"
+          - "Target Job Template ID: {{ target_job_template_id }}"
+
     - name: Require successful Survey enablement
       ansible.builtin.assert:
         that:
@@ -798,7 +837,7 @@
 
 
     # =========================================================
-    # 21. Verify final Job Template 12 Survey
+    # 21. Verify the completed Survey
     # =========================================================
 
     - name: Retrieve final Survey specification
@@ -828,14 +867,14 @@
           - final_survey_spec.json.spec[0].type == 'multiselect'
           - final_survey_spec.json.spec[0].required | bool
         fail_msg: >-
-          Job Template 12 does not contain the expected
+          Job Template 12 does not contain the expected required
           selected_target_choices multiselect Survey.
         success_msg: >-
           Job Template 12 multiselect Survey is correct.
 
 
     # =========================================================
-    # 22. Final summary
+    # 22. Display final result
     # =========================================================
 
     - name: Display final summary
