@@ -370,7 +370,7 @@
         that:
           - awx_controller_url | trim | length > 0
           - not awx_controller_url.endswith('/')
-          - target_job_template_id | int == 11
+          - target_job_template_id | int == 13
           - awx_oauth_token | length > 0
           - cma_survey_names | length > 0
         fail_msg: >-
