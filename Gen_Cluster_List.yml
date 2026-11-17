@@ -1,0 +1,485 @@
+---
+# AWX job template playbook: discover targets for a selected CMA and refresh
+# the target-selection survey on AWX Job Template ID 12.
+#
+# Required survey variable on THIS job template:
+#   selected_cma_name
+#
+# Optional variable on THIS job template:
+#   selected_cma_ip
+# If selected_cma_ip is empty, the playbook looks it up in cma_inventory_file,
+# whose expected format is one record per line: <CMA_NAME> <CMA_IP>.
+#
+# Controller access:
+# Attach an AWX/Controller credential that injects CONTROLLER_HOST and
+# CONTROLLER_OAUTH_TOKEN, or provide awx_controller_url and awx_oauth_token
+# through a protected credential. Do not put the token in source control.
+#
+# Job Template 12 receives:
+#   1. A survey variable named selected_target, with choices such as:
+#        R8120CXL --- Cluster
+#        GW51 --- Gateway
+#   2. Default extra vars selected_cma_name, selected_cma_ip, and
+#      target_inventory_file. The operational playbook must validate those
+#      values against target_inventory_file before acting.
+
+- name: Discover CMA clusters and gateways and update AWX Job Template 12
+  hosts: mds
+  gather_facts: false
+
+  vars:
+    project_dir: /var/log/CDT_Project
+    inventory_dir: "{{ project_dir }}/Inventory"
+    cma_inventory_file: "{{ inventory_dir }}/mds_inventory"
+    deployment_plan: "{{ project_dir }}/Deployment_Plans/inventory.xml"
+
+    target_job_template_id: 12
+    target_survey_variable: selected_target
+    target_survey_question: Select cluster or gateway
+
+    # These values can instead be supplied by an injected AWX credential.
+    awx_controller_url: >-
+      {{ lookup('ansible.builtin.env', 'CONTROLLER_HOST') | default('', true) }}
+    awx_oauth_token: >-
+      {{ lookup('ansible.builtin.env', 'CONTROLLER_OAUTH_TOKEN') | default('', true) }}
+    awx_validate_certs: true
+
+    # /bin/bash -lc creates the requested login shell. Set this to true only
+    # when the AWX SSH user must become cdt_run_user to execute CDT.
+    cdt_become: false
+    cdt_run_user: admin
+
+  tasks:
+    - name: Validate the selected CMA and AWX settings
+      ansible.builtin.assert:
+        that:
+          - (selected_cma_name | default('')) | length > 0
+          - (selected_cma_name | default('')) is match('^[A-Za-z0-9_.-]+$')
+          - (target_job_template_id | int) > 0
+          - (awx_controller_url | default('')) is match('^https?://.+')
+          - (awx_oauth_token | default('')) | length > 0
+        fail_msg: >-
+          selected_cma_name must be a safe CMA name, and controller URL/token
+          must be supplied by an AWX credential or protected extra variables.
+
+    - name: Look up CMA IP when it was not supplied by the survey or workflow
+      ansible.builtin.command:
+        argv:
+          - awk
+          - -v
+          - "selected={{ selected_cma_name }}"
+          - '$1 == selected { print $2; exit }'
+          - "{{ cma_inventory_file }}"
+      register: cma_ip_lookup
+      changed_when: false
+      failed_when: false
+      when: (selected_cma_ip | default('') | trim | length) == 0
+
+    - name: Resolve CMA identity and generated-file paths
+      ansible.builtin.set_fact:
+        cma_name: "{{ selected_cma_name | trim }}"
+        cma_ip: >-
+          {{
+            (selected_cma_ip | default('') | trim)
+            if (selected_cma_ip | default('') | trim | length) > 0
+            else (cma_ip_lookup.stdout | default('') | trim)
+          }}
+        cma_session: "{{ selected_cma_name | trim }}_session"
+        cma_inventory_csv: >-
+          {{ inventory_dir }}/{{ selected_cma_name | trim }}_inventory.csv
+        target_inventory_json: >-
+          {{ inventory_dir }}/{{ selected_cma_name | trim }}_targets.json
+        controller_base_url: "{{ awx_controller_url | regex_replace('/+$', '') }}"
+
+    - name: Validate the resolved CMA IP or hostname
+      ansible.builtin.assert:
+        that:
+          - cma_ip | length > 0
+          - cma_ip is not match('.*\\s.*')
+        fail_msg: >-
+          No CMA IP was supplied and no matching record for {{ cma_name }} was
+          found in {{ cma_inventory_file }}. Expected: <CMA_NAME> <CMA_IP>.
+
+    - name: Ensure the CDT inventory directory exists
+      ansible.builtin.file:
+        path: "{{ inventory_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Remove a stale CMA inventory CSV before generation
+      ansible.builtin.file:
+        path: "{{ cma_inventory_csv }}"
+        state: absent
+
+    - name: Generate the CDT inventory candidates in a login shell
+      ansible.builtin.command:
+        argv:
+          - /bin/bash
+          - -lc
+          - |
+            set -euo pipefail
+            cma_name="$1"
+            session_name="$2"
+            candidates_file="$3"
+            plan_file="$4"
+            cma_server="$5"
+
+            mdsenv "$cma_name"
+
+            if [[ -z "${CDTDIR:-}" ]]; then
+              echo "ERROR: CDTDIR is not defined in the login-shell environment." >&2
+              exit 10
+            fi
+            if [[ ! -x "$CDTDIR/CentralDeploymentTool" ]]; then
+              echo "ERROR: $CDTDIR/CentralDeploymentTool is not executable." >&2
+              exit 11
+            fi
+            if [[ ! -r "$plan_file" ]]; then
+              echo "ERROR: Deployment plan is not readable: $plan_file" >&2
+              exit 12
+            fi
+
+            "$CDTDIR/CentralDeploymentTool" -generate \
+              -session="$session_name" \
+              -candidates="$candidates_file" \
+              -deploymentplan="$plan_file" \
+              -server="$cma_server"
+          - cdt-inventory-generate
+          - "{{ cma_name }}"
+          - "{{ cma_session }}"
+          - "{{ cma_inventory_csv }}"
+          - "{{ deployment_plan }}"
+          - "{{ cma_ip }}"
+      become: "{{ cdt_become | bool }}"
+      become_user: "{{ cdt_run_user }}"
+      register: cdt_generate
+      changed_when: true
+
+    - name: Check that CDT generated a nonempty inventory CSV
+      ansible.builtin.stat:
+        path: "{{ cma_inventory_csv }}"
+      register: inventory_csv_status
+
+    - name: Stop when CDT did not generate the inventory CSV
+      ansible.builtin.assert:
+        that:
+          - inventory_csv_status.stat.exists
+          - inventory_csv_status.stat.isreg
+          - (inventory_csv_status.stat.size | int) > 0
+        fail_msg: >-
+          CDT completed without creating a nonempty inventory file at
+          {{ cma_inventory_csv }}. CDT stdout={{ cdt_generate.stdout | default('') }};
+          stderr={{ cdt_generate.stderr | default('') }}.
+
+    - name: Extract unique cluster names and standalone gateway names
+      ansible.builtin.shell: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import csv
+        import json
+        import os
+        import re
+        import sys
+        import tempfile
+
+        source = os.environ["INVENTORY_CSV"]
+        destination = os.environ["TARGET_JSON"]
+        cma_name = os.environ["CMA_NAME"]
+        cma_ip = os.environ["CMA_IP"]
+
+        def normalize(value):
+            return re.sub(r"[^a-z0-9]+", " ", value.strip().lower()).strip()
+
+        with open(source, "r", encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.reader(handle))
+
+        header_index = None
+        object_index = None
+        cluster_index = None
+        for index, row in enumerate(rows):
+            normalized = [normalize(cell) for cell in row]
+            if "object name" in normalized and "cluster name" in normalized:
+                header_index = index
+                object_index = normalized.index("object name")
+                cluster_index = normalized.index("cluster name")
+                break
+
+        if header_index is None:
+            preview = " | ".join(",".join(row) for row in rows[:5])
+            raise SystemExit(
+                "CDT CSV does not contain the required 'Object Name' and "
+                f"'Cluster Name' columns. First rows: {preview}"
+            )
+
+        targets_by_name = {}
+        not_a_cluster = {"", "n/a", "na", "-", "none", "null"}
+
+        for row in rows[header_index + 1:]:
+            if max(object_index, cluster_index) >= len(row):
+                continue
+            object_name = row[object_index].strip()
+            cluster_name = row[cluster_index].strip()
+
+            # Ignore CDT's separator line and incomplete rows.
+            if not object_name or set(object_name) <= {"="}:
+                continue
+
+            if cluster_name.lower() not in not_a_cluster:
+                target_name = cluster_name
+                target_type = "Cluster"
+            else:
+                target_name = object_name
+                target_type = "Gateway"
+
+            if not target_name or "\n" in target_name or "\r" in target_name:
+                raise SystemExit(f"Unsafe target name found in CDT CSV: {target_name!r}")
+
+            previous = targets_by_name.get(target_name)
+            if previous and previous != target_type:
+                raise SystemExit(
+                    f"Target {target_name!r} appeared as both {previous} and {target_type}."
+                )
+            targets_by_name[target_name] = target_type
+
+        targets = [
+            {"name": name, "type": target_type}
+            for name, target_type in targets_by_name.items()
+        ]
+        targets.sort(key=lambda item: (0 if item["type"] == "Cluster" else 1,
+                                       item["name"].casefold()))
+
+        if not targets:
+            raise SystemExit("No cluster or standalone gateway was found in the CDT CSV.")
+
+        payload = {
+            "cma_name": cma_name,
+            "cma_ip": cma_ip,
+            "generated_from": source,
+            "targets": targets,
+        }
+
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        file_descriptor, temporary_path = tempfile.mkstemp(
+            prefix=".targets-", suffix=".json", dir=os.path.dirname(destination)
+        )
+        try:
+            with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, sort_keys=False)
+                handle.write("\n")
+            os.chmod(temporary_path, 0o640)
+            os.replace(temporary_path, destination)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+
+        for target in targets:
+            print(f'{target["name"]} --- {target["type"]}')
+        PY
+      args:
+        executable: /bin/bash
+      environment:
+        INVENTORY_CSV: "{{ cma_inventory_csv }}"
+        TARGET_JSON: "{{ target_inventory_json }}"
+        CMA_NAME: "{{ cma_name }}"
+        CMA_IP: "{{ cma_ip }}"
+      register: parsed_targets
+      changed_when: true
+
+    - name: Build the target choices for the AWX survey
+      ansible.builtin.set_fact:
+        target_choices: "{{ parsed_targets.stdout_lines }}"
+        target_choices_text: "{{ parsed_targets.stdout_lines | join('\n') }}"
+
+    - name: Validate generated target choices
+      ansible.builtin.assert:
+        that:
+          - target_choices | length > 0
+          - target_choices | select('match', '^.+ --- (Cluster|Gateway)$') | list | length == target_choices | length
+        fail_msg: "Target menu generation returned invalid choices: {{ target_choices }}"
+
+    - name: Read AWX Job Template 12
+      ansible.builtin.uri:
+        url: >-
+          {{ controller_base_url }}/api/v2/job_templates/{{ target_job_template_id }}/
+        method: GET
+        headers:
+          Authorization: "Bearer {{ awx_oauth_token }}"
+        return_content: true
+        validate_certs: "{{ awx_validate_certs | bool }}"
+        status_code: 200
+      delegate_to: localhost
+      run_once: true
+      register: target_template_info
+      no_log: true
+
+    - name: Read the existing survey from AWX Job Template 12
+      ansible.builtin.uri:
+        url: >-
+          {{ controller_base_url }}/api/v2/job_templates/{{ target_job_template_id }}/survey_spec/
+        method: GET
+        headers:
+          Authorization: "Bearer {{ awx_oauth_token }}"
+        return_content: true
+        validate_certs: "{{ awx_validate_certs | bool }}"
+        status_code: 200
+      delegate_to: localhost
+      run_once: true
+      register: existing_survey
+      no_log: true
+
+    - name: Initialize the replacement survey question list
+      ansible.builtin.set_fact:
+        replacement_survey_questions: []
+
+    - name: Preserve every survey question and refresh selected_target choices
+      ansible.builtin.set_fact:
+        replacement_survey_questions: >-
+          {{
+            replacement_survey_questions
+            + [
+                item | combine(
+                  {
+                    'question_name': target_survey_question,
+                    'question_description':
+                      'Generated for ' ~ cma_name ~ ' (' ~ cma_ip ~ ').',
+                    'required': true,
+                    'type': 'multiplechoice',
+                    'default': '',
+                    'choices': target_choices_text
+                  }
+                )
+                if (item.variable | default('')) == target_survey_variable
+                else item
+              ]
+          }}
+      loop: "{{ existing_survey.json.spec | default([]) }}"
+      loop_control:
+        label: "{{ item.variable | default(item.question_name | default('unnamed')) }}"
+
+    - name: Add the selected_target question when Job Template 12 does not have it
+      ansible.builtin.set_fact:
+        replacement_survey_questions: >-
+          {{
+            replacement_survey_questions
+            + [
+                {
+                  'question_name': target_survey_question,
+                  'question_description':
+                    'Generated for ' ~ cma_name ~ ' (' ~ cma_ip ~ ').',
+                  'required': true,
+                  'type': 'multiplechoice',
+                  'variable': target_survey_variable,
+                  'min': none,
+                  'max': none,
+                  'default': '',
+                  'choices': target_choices_text
+                }
+              ]
+          }}
+      when: >-
+        (
+          existing_survey.json.spec | default([])
+          | selectattr('variable', 'defined')
+          | selectattr('variable', 'equalto', target_survey_variable)
+          | list
+          | length
+        ) == 0
+
+    - name: Parse and validate existing Job Template 12 extra variables
+      ansible.builtin.set_fact:
+        existing_template_extra_vars: >-
+          {{
+            target_template_info.json.extra_vars
+            | default('{}', true)
+            | from_yaml
+            | default({}, true)
+          }}
+
+    - name: Ensure Job Template 12 extra variables are a mapping
+      ansible.builtin.assert:
+        that:
+          - existing_template_extra_vars is mapping
+        fail_msg: >-
+          Job Template {{ target_job_template_id }} extra_vars is not a YAML/JSON
+          mapping, so CMA context cannot be merged safely.
+
+    - name: Merge current CMA context into Job Template 12 extra variables
+      ansible.builtin.set_fact:
+        replacement_template_extra_vars: >-
+          {{
+            existing_template_extra_vars
+            | combine(
+                {
+                  'selected_cma_name': cma_name,
+                  'selected_cma_ip': cma_ip,
+                  'target_inventory_file': target_inventory_json
+                },
+                recursive=true
+              )
+          }}
+
+    - name: Save CMA context and enable the survey on Job Template 12
+      ansible.builtin.uri:
+        url: >-
+          {{ controller_base_url }}/api/v2/job_templates/{{ target_job_template_id }}/
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ awx_oauth_token }}"
+        body_format: json
+        body:
+          survey_enabled: true
+          extra_vars: "{{ replacement_template_extra_vars | to_nice_yaml(indent=2) }}"
+        return_content: true
+        validate_certs: "{{ awx_validate_certs | bool }}"
+        status_code: 200
+      delegate_to: localhost
+      run_once: true
+      no_log: true
+
+    - name: Replace the survey specification on AWX Job Template 12
+      ansible.builtin.uri:
+        url: >-
+          {{ controller_base_url }}/api/v2/job_templates/{{ target_job_template_id }}/survey_spec/
+        method: POST
+        headers:
+          Authorization: "Bearer {{ awx_oauth_token }}"
+        body_format: json
+        body:
+          name: >-
+            {{ existing_survey.json.name | default('CDT target selection', true) }}
+          description: >-
+            {{
+              existing_survey.json.description
+              | default('Select a target discovered from the chosen CMA.', true)
+            }}
+          spec: "{{ replacement_survey_questions }}"
+        return_content: true
+        validate_certs: "{{ awx_validate_certs | bool }}"
+        status_code:
+          - 200
+          - 201
+      delegate_to: localhost
+      run_once: true
+      no_log: true
+
+    - name: Publish CMA and target data to a following workflow node
+      ansible.builtin.set_stats:
+        data:
+          selected_cma_name: "{{ cma_name }}"
+          selected_cma_ip: "{{ cma_ip }}"
+          target_inventory_file: "{{ target_inventory_json }}"
+          discovered_target_choices: "{{ target_choices }}"
+
+    - name: Show the menu now available on Job Template 12
+      ansible.builtin.debug:
+        msg: |
+          AWX Job Template {{ target_job_template_id }} has been updated for:
+            CMA: {{ cma_name }}
+            CMA IP: {{ cma_ip }}
+
+          Survey variable: {{ target_survey_variable }}
+          Choices:
+          {{ target_choices_text | indent(2, true) }}
+
+          Validation inventory:
+            {{ target_inventory_json }}
