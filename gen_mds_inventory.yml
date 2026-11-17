@@ -111,4 +111,110 @@
     - name: Check existing mds_inventory path
       ansible.builtin.stat:
         path: "{{ inventory_file }}"
-      register
+      register: existing_inventory_path
+
+
+    # =========================================================
+    # 6. Remove old incorrect mds_inventory directory
+    #
+    # Removes this incorrect structure:
+    #
+    # /var/log/CDT_Project/Inventory/mds_inventory/
+    # └── mds_inventory
+    #
+    # This task does not remove an existing correct file.
+    # =========================================================
+
+    - name: Remove old incorrect mds_inventory directory
+      ansible.builtin.file:
+        path: "{{ inventory_file }}"
+        state: absent
+      when:
+        - existing_inventory_path.stat.exists | default(false)
+        - existing_inventory_path.stat.isdir | default(false)
+
+
+    # =========================================================
+    # 7. Write the correct mds_inventory file
+    # =========================================================
+
+    - name: Write MDS inventory file
+      ansible.builtin.copy:
+        content: |
+          {{ cma_inventory.stdout | trim }}
+        dest: "{{ inventory_file }}"
+        mode: "0644"
+      register: inventory_write_result
+
+
+    # =========================================================
+    # 8. Verify that mds_inventory is now a regular file
+    # =========================================================
+
+    - name: Check generated MDS inventory file
+      ansible.builtin.stat:
+        path: "{{ inventory_file }}"
+      register: generated_inventory_stat
+
+    - name: Fail if mds_inventory is not a regular file
+      ansible.builtin.fail:
+        msg: |
+          {{ inventory_file }} was not created as a regular file.
+      when:
+        - not generated_inventory_stat.stat.exists | default(false) or
+          not generated_inventory_stat.stat.isreg | default(false)
+
+
+    # =========================================================
+    # 9. Read back the generated file
+    # =========================================================
+
+    - name: Read generated MDS inventory file
+      ansible.builtin.slurp:
+        src: "{{ inventory_file }}"
+      register: generated_inventory_raw
+
+    - name: Set generated inventory facts
+      ansible.builtin.set_fact:
+        generated_inventory_content: >-
+          {{
+            generated_inventory_raw.content
+            | b64decode
+            | trim
+          }}
+
+        generated_cma_list: >-
+          {{
+            (
+              generated_inventory_raw.content
+              | b64decode
+              | trim
+            ).splitlines()
+          }}
+
+
+    # =========================================================
+    # 10. Display final result in AWX output
+    # =========================================================
+
+    - name: Display generated MDS inventory
+      ansible.builtin.debug:
+        msg:
+          - "MDS inventory generated successfully"
+          - "File: {{ inventory_file }}"
+          - "CMA count: {{ generated_cma_list | length }}"
+          - "CMA entries: {{ generated_cma_list }}"
+
+
+    # =========================================================
+    # 11. Store results as AWX job artifacts
+    # =========================================================
+
+    - name: Store MDS inventory as AWX artifacts
+      ansible.builtin.set_stats:
+        data:
+          mds_inventory_file: "{{ inventory_file }}"
+          mds_inventory: "{{ generated_inventory_content }}"
+          cma_count: "{{ generated_cma_list | length }}"
+          cma_list: "{{ generated_cma_list }}"
+        per_host: false
