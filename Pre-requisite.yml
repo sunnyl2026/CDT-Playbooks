@@ -1,0 +1,328 @@
+---
+- name: Run approved CDT prerequisite generation
+  hosts: all
+  gather_facts: false
+  become: false
+
+  vars:
+    filters_base_dir: "/var/log/CDT_Project/Filters"
+    candidates_dir: "/var/log/CDT_Project/candidates"
+    deployment_plan: "/var/log/CDT_Project/Deployment_Plans/pre-upgrade-check.xml"
+
+  tasks:
+
+    # ============================================================
+    # Validate survey input
+    # ============================================================
+
+    - name: Validate job_id from AWX Survey
+      ansible.builtin.assert:
+        that:
+          - job_id is defined
+          - job_id | string | trim | length > 0
+          - job_id | string | trim is match('^[A-Za-z0-9_-]+$')
+        fail_msg: |
+          A valid job_id is required.
+
+          Example:
+          CHG0012345
+
+    - name: Normalize job_id and define paths
+      ansible.builtin.set_fact:
+        normalized_job_id: "{{ job_id | string | trim }}"
+        job_folder: "{{ filters_base_dir }}/{{ job_id | string | trim }}"
+        selected_targets_file: >-
+          {{ filters_base_dir }}/{{ job_id | string | trim }}/selected_targets.yml
+
+    # ============================================================
+    # Read selected_targets.yml again
+    # ============================================================
+
+    - name: Check selected_targets.yml
+      ansible.builtin.stat:
+        path: "{{ selected_targets_file }}"
+      register: selected_targets_stat
+
+    - name: Stop if selected_targets.yml does not exist
+      ansible.builtin.fail:
+        msg: |
+          selected_targets.yml was not found:
+
+          {{ selected_targets_file }}
+      when: not selected_targets_stat.stat.exists
+
+    - name: Read selected_targets.yml
+      ansible.builtin.slurp:
+        src: "{{ selected_targets_file }}"
+      register: selected_targets_raw
+
+    - name: Parse selected_targets.yml
+      ansible.builtin.set_fact:
+        selected_targets_data: >-
+          {{
+            selected_targets_raw.content
+            | b64decode
+            | from_yaml
+          }}
+
+    - name: Validate selected_targets.yml
+      ansible.builtin.assert:
+        that:
+          - selected_targets_data is mapping
+          - selected_targets_data.job_id is defined
+          - selected_targets_data.job_id | string | trim == normalized_job_id
+          - selected_targets_data.selected_cmas is defined
+          - selected_targets_data.selected_cmas is sequence
+          - selected_targets_data.selected_cmas | length > 0
+        fail_msg: |
+          selected_targets.yml is invalid or the job_id does not match.
+
+          Survey job_id:
+          {{ normalized_job_id }}
+
+          File job_id:
+          {{ selected_targets_data.job_id | default('NOT DEFINED') }}
+
+    - name: Validate each selected CMA
+      ansible.builtin.assert:
+        that:
+          - item.cma_name is defined
+          - item.cma_name | string | trim | length > 0
+          - item.cma_name | string | trim is match('^[A-Za-z0-9_.-]+$')
+          - item.cma_ip is defined
+          - item.cma_ip | string | trim | length > 0
+        fail_msg: |
+          Invalid CMA entry:
+
+          {{ item | to_nice_yaml }}
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name | default('UNKNOWN CMA') }}"
+
+    # ============================================================
+    # Check deployment plan
+    # ============================================================
+
+    - name: Check CDT deployment plan
+      ansible.builtin.stat:
+        path: "{{ deployment_plan }}"
+      register: deployment_plan_stat
+
+    - name: Stop if deployment plan does not exist
+      ansible.builtin.fail:
+        msg: |
+          CDT deployment plan was not found:
+
+          {{ deployment_plan }}
+      when: not deployment_plan_stat.stat.exists
+
+    - name: Ensure candidates directory exists
+      ansible.builtin.file:
+        path: "{{ candidates_dir }}"
+        state: directory
+        mode: "0755"
+
+    # ============================================================
+    # Show approved execution scope
+    # ============================================================
+
+    - name: Show approved CDT generation scope
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          APPROVED PREREQUISITE CHECK GENERATION
+
+          Job ID:
+          {{ normalized_job_id }}
+
+          CMA:
+          {{ item.cma_name }}
+
+          CMA IP:
+          {{ item.cma_ip }}
+
+          Candidate output:
+          {{ candidates_dir }}/{{ item.cma_name }}_PR_candidates.csv
+          ============================================================
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+
+    # ============================================================
+    # Start unfiltered CDT jobs in parallel
+    # ============================================================
+
+    - name: Start approved CDT generation for all CMAs in parallel
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -o pipefail
+
+          mdsenv {{ item.cma_name | quote }}
+
+          if [[ -z "${CDTDIR:-}" ]]; then
+              echo "ERROR: CDTDIR is not defined after mdsenv {{ item.cma_name }}"
+              exit 1
+          fi
+
+          echo "CMA={{ item.cma_name }}"
+          echo "CMA_IP={{ item.cma_ip }}"
+          echo "CDTDIR=${CDTDIR}"
+          echo "CANDIDATES={{ candidates_dir }}/{{ item.cma_name }}_PR_candidates.csv"
+
+          "${CDTDIR}/CentralDeploymentTool" -generate \
+            -session={{ (item.cma_name ~ '_session') | quote }} \
+            -candidates={{ (candidates_dir ~ '/' ~ item.cma_name ~ '_PR_candidates.csv') | quote }} \
+            -deploymentplan={{ deployment_plan | quote }} \
+            -server={{ item.cma_ip | quote }}
+      args:
+        executable: /bin/bash
+      environment:
+        HOME: "{{ ansible_env.HOME | default('/root') }}"
+      async: 7200
+      poll: 0
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+      register: approved_cdt_async_jobs
+      changed_when: true
+
+    # ============================================================
+    # Wait for every parallel job
+    # ============================================================
+
+    - name: Wait for approved CDT generation to complete
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      loop: "{{ approved_cdt_async_jobs.results }}"
+      loop_control:
+        label: "{{ item.item.cma_name }}"
+      register: approved_cdt_results
+      until: approved_cdt_results.finished
+      retries: 240
+      delay: 30
+      failed_when: false
+
+    - name: Show approved CDT command results
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          CMA: {{ item.item.item.cma_name }}
+          CMA IP: {{ item.item.item.cma_ip }}
+          Return code: {{ item.rc | default('UNKNOWN') }}
+
+          Standard output:
+          {{ item.stdout | default('') }}
+
+          Standard error:
+          {{ item.stderr | default('') }}
+          ============================================================
+      loop: "{{ approved_cdt_results.results }}"
+      loop_control:
+        label: "{{ item.item.item.cma_name }}"
+
+    - name: Stop if any approved CDT command failed
+      ansible.builtin.assert:
+        that:
+          - item.finished | default(false)
+          - item.rc | default(1) == 0
+        fail_msg: |
+          Approved CDT generation failed.
+
+          CMA:
+          {{ item.item.item.cma_name }}
+
+          CMA IP:
+          {{ item.item.item.cma_ip }}
+
+          Return code:
+          {{ item.rc | default('UNKNOWN') }}
+
+          Standard output:
+          {{ item.stdout | default('') }}
+
+          Standard error:
+          {{ item.stderr | default('') }}
+      loop: "{{ approved_cdt_results.results }}"
+      loop_control:
+        label: "{{ item.item.item.cma_name }}"
+
+    # ============================================================
+    # Read updated candidate files
+    # ============================================================
+
+    - name: Check updated candidate CSV files
+      ansible.builtin.stat:
+        path: "{{ candidates_dir }}/{{ item.cma_name }}_PR_candidates.csv"
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+      register: updated_candidate_stats
+
+    - name: Stop if an updated candidate file is missing
+      ansible.builtin.fail:
+        msg: |
+          Updated candidate file was not found.
+
+          CMA:
+          {{ item.item.cma_name }}
+
+          Expected file:
+          {{ candidates_dir }}/{{ item.item.cma_name }}_PR_candidates.csv
+      when: not item.stat.exists
+      loop: "{{ updated_candidate_stats.results }}"
+      loop_control:
+        label: "{{ item.item.cma_name }}"
+
+    - name: Read updated candidate CSV files
+      ansible.builtin.slurp:
+        src: "{{ candidates_dir }}/{{ item.cma_name }}_PR_candidates.csv"
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+      register: updated_candidate_files
+
+    # ============================================================
+    # Final updated summary
+    # ============================================================
+
+    - name: Show updated candidate summary
+      ansible.builtin.debug:
+        msg: |
+          ################################################################
+          CMA: {{ item.item.cma_name }}
+          CMA IP: {{ item.item.cma_ip }}
+
+          Updated candidate file:
+          {{ candidates_dir }}/{{ item.item.cma_name }}_PR_candidates.csv
+
+          Updated candidate content:
+          ----------------------------------------------------------------
+          {{ item.content | b64decode | trim }}
+          ----------------------------------------------------------------
+          ################################################################
+      loop: "{{ updated_candidate_files.results }}"
+      loop_control:
+        label: "{{ item.item.cma_name }}"
+
+    - name: Show final completion summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          APPROVED CDT GENERATION COMPLETED
+          ============================================================
+
+          Job ID:
+          {{ normalized_job_id }}
+
+          CMA count:
+          {{ selected_targets_data.selected_cmas | length }}
+
+          Processed CMAs:
+          {% for cma in selected_targets_data.selected_cmas %}
+          - {{ cma.cma_name }}
+            Server: {{ cma.cma_ip }}
+            Candidates: {{ candidates_dir }}/{{ cma.cma_name }}_PR_candidates.csv
+          {% endfor %}
+
+          ============================================================
