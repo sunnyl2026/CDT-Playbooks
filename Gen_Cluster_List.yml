@@ -4,26 +4,16 @@
   gather_facts: false
 
   vars:
-    # =========================================================
-    # MDS and CDT configuration
-    # =========================================================
-
     ansible_python_interpreter: /usr/bin/python3
 
     mds_inventory_file: /var/log/CDT_Project/Inventory/mds_inventory
     cdt_inventory_directory: /var/log/CDT_Project/Inventory
     deployment_plan_file: /var/log/CDT_Project/Deployment_Plans/inventory.xml
 
-    # =========================================================
-    # AWX API configuration
-    # =========================================================
-
     target_job_template_id: 12
 
-    # Confirmed AWX NodePort endpoint.
     awx_controller_url: "http://172.20.50.28:30080"
 
-    # Injected by the existing AWX API Token credential.
     awx_oauth_token: >-
       {{
         lookup('ansible.builtin.env', 'AWX_OAUTH_TOKEN')
@@ -47,8 +37,6 @@
         fail_msg: |
           No CMA was selected.
 
-          Launch this Job Template through the CMA Survey.
-
           Required Survey variable:
           selected_cma_name
         success_msg: >-
@@ -65,7 +53,7 @@
 
 
     # =========================================================
-    # 2. Validate MDS inventory
+    # 2. Validate MDS inventory file
     # =========================================================
 
     - name: Check MDS inventory file
@@ -83,8 +71,6 @@
           The MDS inventory file is missing or empty:
 
           {{ mds_inventory_file }}
-
-          Run the MDS inventory-generation Job Template first.
         success_msg: >-
           MDS inventory file is available.
 
@@ -107,21 +93,9 @@
             | trim
           }}
 
-    - name: Display current MDS inventory
-      ansible.builtin.debug:
-        msg: |
-          Current MDS inventory:
-
-          {{ mds_inventory_content }}
-
 
     # =========================================================
     # 4. Resolve selected CMA and IP
-    #
-    # Expected file:
-    #
-    # CMA1_Pri_SMS 172.20.50.31
-    # CMA2_SMS1    172.20.50.41
     # =========================================================
 
     - name: Initialize selected CMA matches
@@ -155,18 +129,16 @@
         that:
           - selected_cma_matches | length == 1
         fail_msg: |
-          Expected exactly one inventory entry for CMA:
+          Expected exactly one inventory entry for:
 
           {{ selected_cma_name_normalized }}
 
-          Matching entries found:
+          Matching entries:
           {{ selected_cma_matches | length }}
 
           Current MDS inventory:
 
           {{ mds_inventory_content }}
-
-          Regenerate the MDS inventory and refresh the CMA Survey.
         success_msg: >-
           Found exactly one entry for
           {{ selected_cma_name_normalized }}.
@@ -222,7 +194,7 @@
 
 
     # =========================================================
-    # 6. Validate required paths
+    # 6. Validate paths
     # =========================================================
 
     - name: Ensure CDT inventory directory exists
@@ -243,8 +215,7 @@
           - deployment_plan_stat.stat.isreg | default(false)
           - deployment_plan_stat.stat.size | default(0) | int > 0
         fail_msg: |
-          The CentralDeploymentTool deployment plan is missing
-          or empty:
+          The deployment plan is missing or empty:
 
           {{ deployment_plan_file }}
         success_msg: >-
@@ -263,16 +234,6 @@
 
     # =========================================================
     # 8. Build exact login-shell command
-    #
-    # Required:
-    #
-    # mdsenv CMA_Name
-    #
-    # $CDTDIR/CentralDeploymentTool -generate \
-    #   -session=CMA_Name_session \
-    #   -candidates=CMA_Name_inventory.csv \
-    #   -deploymentplan=inventory.xml \
-    #   -server=CMA_IP
     # =========================================================
 
     - name: Build CentralDeploymentTool login-shell command
@@ -283,16 +244,13 @@
           echo "Selected CMA: {{ selected_cma.name }}"
           echo "Selected CMA IP: {{ selected_cma.ip }}"
 
-          echo "===== VERIFY MDSENV ====="
-
           if ! command -v mdsenv >/dev/null 2>&1; then
-              echo "ERROR: mdsenv is not available in the login shell" >&2
+              echo "ERROR: mdsenv is unavailable in the login shell" >&2
               echo "PATH=${PATH}" >&2
               exit 20
           fi
 
           echo "mdsenv path: $(command -v mdsenv)"
-
           echo "===== SWITCH TO SELECTED CMA ====="
 
           mdsenv {{ selected_cma.name | quote }}
@@ -311,7 +269,7 @@
           echo "CDTDIR=${CDTDIR:-NOT_SET}"
 
           if [ -z "${CDTDIR:-}" ]; then
-              echo "ERROR: CDTDIR is not defined in the login shell" >&2
+              echo "ERROR: CDTDIR is undefined" >&2
               exit 22
           fi
 
@@ -320,8 +278,6 @@
               echo "${CDTDIR}/CentralDeploymentTool" >&2
               exit 23
           fi
-
-          echo "CentralDeploymentTool path: ${CDTDIR}/CentralDeploymentTool"
 
           echo "===== RUN CENTRAL DEPLOYMENT TOOL ====="
 
@@ -353,11 +309,6 @@
       changed_when: true
       failed_when: false
 
-
-    # =========================================================
-    # 10. Display CentralDeploymentTool output
-    # =========================================================
-
     - name: Display CentralDeploymentTool result
       ansible.builtin.debug:
         msg: |
@@ -369,11 +320,6 @@
 
           STDERR:
           {{ cdt_generation_result.stderr | default('') }}
-
-
-    # =========================================================
-    # 11. Require successful generation
-    # =========================================================
 
     - name: Require successful CentralDeploymentTool generation
       ansible.builtin.assert:
@@ -388,15 +334,6 @@
           CMA IP:
           {{ selected_cma.ip }}
 
-          Session:
-          {{ cdt_session_name }}
-
-          Candidates:
-          {{ cma_inventory_file }}
-
-          Deployment plan:
-          {{ deployment_plan_file }}
-
           Return code:
           {{ cdt_generation_result.rc }}
 
@@ -406,11 +343,11 @@
           STDERR:
           {{ cdt_generation_result.stderr | default('') }}
         success_msg: >-
-          CentralDeploymentTool generated the CMA candidate inventory.
+          CentralDeploymentTool generated the candidate inventory.
 
 
     # =========================================================
-    # 12. Validate generated candidate inventory
+    # 10. Validate generated candidate inventory
     # =========================================================
 
     - name: Check generated CMA candidate inventory
@@ -425,8 +362,7 @@
           - cma_inventory_stat.stat.isreg | default(false)
           - cma_inventory_stat.stat.size | default(0) | int > 0
         fail_msg: |
-          CentralDeploymentTool completed, but the candidates file
-          is missing or empty:
+          The generated candidates file is missing or empty:
 
           {{ cma_inventory_file }}
         success_msg: >-
@@ -434,7 +370,7 @@
 
 
     # =========================================================
-    # 13. Read CentralDeploymentTool candidate inventory
+    # 11. Read generated candidate inventory
     # =========================================================
 
     - name: Read generated CMA candidate inventory
@@ -460,9 +396,7 @@
 
 
     # =========================================================
-    # 14. Extract cluster and standalone gateway names
-    #
-    # Rules:
+    # 12. Extract clusters and standalone gateways
     #
     # Cluster Name != N/A:
     #   Use Cluster Name.
@@ -509,15 +443,7 @@
 
 
     # =========================================================
-    # 15. Build unique Survey choices
-    #
-    # Example result:
-    #
-    # target_survey_choices:
-    #   - CXL103 (Cluster)
-    #   - R8120GW201 (Gateway)
-    #
-    # Keep this as a list. Do not join it into a text string.
+    # 13. Build unique Survey choices
     # =========================================================
 
     - name: Build unique sorted target choices
@@ -539,10 +465,6 @@
           from:
 
           {{ cma_inventory_file }}
-
-          Generated candidate inventory:
-
-          {{ generated_inventory_content }}
         success_msg: >-
           Extracted {{ target_survey_choices | length }}
           unique target choices.
@@ -556,7 +478,51 @@
 
 
     # =========================================================
-    # 16. Validate AWX API configuration
+    # 14. Create AWX choices using real line-feed characters
+    #
+    # This produces:
+    #
+    # CXL103 (Cluster)
+    # R8120GW201 (Gateway)
+    #
+    # as one string containing a real LF between choices.
+    #
+    # It does not produce a literal backslash followed by n.
+    # =========================================================
+
+    - name: Build AWX multiselect choices string
+      ansible.builtin.set_fact:
+        target_survey_choices_text: |-
+          {% for target_choice in target_survey_choices %}
+          {{ target_choice }}
+          {% endfor %}
+
+    - name: Display AWX choices line-by-line
+      ansible.builtin.debug:
+        msg: |
+          AWX multiselect choices:
+
+          {{ target_survey_choices_text }}
+
+    - name: Verify AWX choices contain real separate lines
+      ansible.builtin.assert:
+        that:
+          - target_survey_choices_text.splitlines() | length == target_survey_choices | length
+          - "'\\n' not in target_survey_choices_text"
+        fail_msg: |
+          AWX choice formatting is incorrect.
+
+          Structured choices:
+          {{ target_survey_choices }}
+
+          Rendered choice text:
+          {{ target_survey_choices_text }}
+        success_msg: >-
+          AWX choices are formatted as separate lines.
+
+
+    # =========================================================
+    # 15. Validate AWX API configuration
     # =========================================================
 
     - name: Display AWX API credential status
@@ -576,14 +542,14 @@
         fail_msg: |
           AWX API configuration is incomplete.
 
-          Check the AWX controller URL and confirm that the
-          AWX API Token credential is attached to this Job Template.
+          Check the AWX controller URL and confirm the
+          AWX API Token credential is attached.
         success_msg: >-
           AWX API configuration is available.
 
 
     # =========================================================
-    # 17. Test AWX API root
+    # 16. Test AWX API
     # =========================================================
 
     - name: Test AWX API root
@@ -598,15 +564,9 @@
       register: awx_api_test
       changed_when: false
 
-    - name: Display AWX API result
-      ansible.builtin.debug:
-        msg:
-          - "AWX API status: {{ awx_api_test.status }}"
-          - "AWX controller: {{ awx_controller_url }}"
-
 
     # =========================================================
-    # 18. Verify access to Job Template 12
+    # 17. Verify Job Template 12 access
     # =========================================================
 
     - name: Check authenticated access to Job Template 12
@@ -645,27 +605,18 @@
 
           HTTP status:
           {{ target_template_test.status }}
-
-          401 = OAuth token is invalid or expired.
-          403 = Token owner lacks permission.
-          404 = Job Template 12 was not found.
         success_msg: >-
           Job Template 12 is accessible.
 
 
     # =========================================================
-    # 19. Update Job Template 12 multiselect Survey
+    # 18. Update Job Template 12 multiselect Survey
     #
-    # IMPORTANT:
+    # For this AWX version:
     #
-    # choices is sent as an actual JSON list:
-    #
-    # [
-    #   "CXL103 (Cluster)",
-    #   "R8120GW201 (Gateway)"
-    # ]
-    #
-    # Do not convert the list into a newline-delimited string.
+    # type    = multiselect
+    # choices = string with real LF separators
+    # default = empty string
     # =========================================================
 
     - name: Update multiselect Survey on Job Template 12
@@ -673,27 +624,40 @@
         url: >-
           {{ awx_controller_url }}/api/v2/job_templates/{{ target_job_template_id }}/survey_spec/
         method: POST
+
         headers:
           Authorization: "Bearer {{ awx_oauth_token }}"
           Accept: "application/json"
           Content-Type: "application/json"
+
         body_format: json
+
         body:
           name: "Cluster and Gateway Selection"
+
           description: >-
             Select one or more clusters or gateways from
             {{ selected_cma.name }}.
+
           spec:
             - question_name: "Select Cluster / Gateway"
+
               question_description: >-
                 Select one or more targets for the CDT operation.
+
               required: true
+
               type: "multiselect"
+
               variable: "selected_target_choices"
-              choices: "{{ target_survey_choices }}"
-              default: []
+
+              choices: "{{ target_survey_choices_text }}"
+
+              default: ""
+
         validate_certs: "{{ awx_validate_certs }}"
-        return_content: false
+        return_content: true
+
         status_code:
           - 200
           - 201
@@ -701,6 +665,7 @@
           - 401
           - 403
           - 404
+
       delegate_to: localhost
       run_once: true
       register: survey_update_result
@@ -717,21 +682,18 @@
         that:
           - survey_update_result.status | int in [200, 201]
         fail_msg: |
-          Updating the multiselect Survey on Job Template 12 failed.
+          Updating the multiselect Survey failed.
 
           HTTP status:
           {{ survey_update_result.status }}
 
-          400 = Invalid Survey specification.
-          401 = Invalid or expired OAuth token.
-          403 = Token owner lacks permission.
-          404 = Job Template or Survey endpoint was not found.
+          AWX rejected the Survey specification.
         success_msg: >-
           Job Template 12 multiselect Survey was updated.
 
 
     # =========================================================
-    # 20. Enable Survey on Job Template 12
+    # 19. Enable Survey
     # =========================================================
 
     - name: Enable Survey on Job Template 12
@@ -739,45 +701,45 @@
         url: >-
           {{ awx_controller_url }}/api/v2/job_templates/{{ target_job_template_id }}/
         method: PATCH
+
         headers:
           Authorization: "Bearer {{ awx_oauth_token }}"
           Accept: "application/json"
           Content-Type: "application/json"
+
         body_format: json
+
         body:
           survey_enabled: true
+
         validate_certs: "{{ awx_validate_certs }}"
         return_content: false
+
         status_code:
           - 200
           - 400
           - 401
           - 403
           - 404
+
       delegate_to: localhost
       run_once: true
       register: survey_enable_result
       no_log: true
-
-    - name: Display Survey enable status
-      ansible.builtin.debug:
-        msg:
-          - "Survey enable status: {{ survey_enable_result.status }}"
-          - "Target Job Template ID: {{ target_job_template_id }}"
 
     - name: Require successful Survey enablement
       ansible.builtin.assert:
         that:
           - survey_enable_result.status | int == 200
         fail_msg: >-
-          Enabling the Survey on Job Template 12 failed with
-          HTTP status {{ survey_enable_result.status }}.
+          Enabling the Survey failed with HTTP status
+          {{ survey_enable_result.status }}.
         success_msg: >-
           Survey was enabled on Job Template 12.
 
 
     # =========================================================
-    # 21. Verify final Survey
+    # 20. Retrieve final Survey
     # =========================================================
 
     - name: Retrieve final Survey specification
@@ -785,17 +747,25 @@
         url: >-
           {{ awx_controller_url }}/api/v2/job_templates/{{ target_job_template_id }}/survey_spec/
         method: GET
+
         headers:
           Authorization: "Bearer {{ awx_oauth_token }}"
           Accept: "application/json"
+
         validate_certs: "{{ awx_validate_certs }}"
         return_content: true
         status_code: 200
+
       delegate_to: localhost
       run_once: true
       register: final_survey_spec
       changed_when: false
       no_log: true
+
+
+    # =========================================================
+    # 21. Verify final Survey
+    # =========================================================
 
     - name: Verify final Survey structure
       ansible.builtin.assert:
@@ -806,22 +776,36 @@
           - final_survey_spec.json.spec[0].variable == 'selected_target_choices'
           - final_survey_spec.json.spec[0].type == 'multiselect'
           - final_survey_spec.json.spec[0].required | bool
-          - final_survey_spec.json.spec[0].choices is iterable
-          - final_survey_spec.json.spec[0].choices is not string
-          - final_survey_spec.json.spec[0].choices | length == target_survey_choices | length
-        fail_msg: |
+        fail_msg: >-
           Job Template 12 does not contain the expected
-          selected_target_choices multiselect Survey with separate
-          selectable choices.
+          selected_target_choices multiselect Survey.
         success_msg: >-
           Job Template 12 multiselect Survey structure is correct.
+
+    - name: Verify final Survey choices
+      ansible.builtin.assert:
+        that:
+          - final_survey_spec.json.spec[0].choices.splitlines() | length == target_survey_choices | length
+          - final_survey_spec.json.spec[0].choices.splitlines() == target_survey_choices
+        fail_msg: |
+          The final Survey choices do not match the generated target list.
+
+          Expected:
+          {{ target_survey_choices }}
+
+          Stored:
+          {{ final_survey_spec.json.spec[0].choices }}
+        success_msg: >-
+          Job Template 12 contains separate multiselect choices.
 
     - name: Display verified Survey choices
       ansible.builtin.debug:
         msg:
           - "Survey type: {{ final_survey_spec.json.spec[0].type }}"
           - "Survey variable: {{ final_survey_spec.json.spec[0].variable }}"
-          - "Survey choices: {{ final_survey_spec.json.spec[0].choices }}"
+          - >-
+            Survey choices:
+            {{ final_survey_spec.json.spec[0].choices.splitlines() }}
 
 
     # =========================================================
