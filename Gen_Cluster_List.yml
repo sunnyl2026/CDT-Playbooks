@@ -19,7 +19,7 @@
 # Cluster Name is N/A becomes a standalone Gateway choice.
 
 - name: Discover CMA targets and update the target-selection survey
-  hosts: mds
+  hosts: all
   gather_facts: false
   any_errors_fatal: true
 
