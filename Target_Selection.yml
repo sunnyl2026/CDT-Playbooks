@@ -12,9 +12,8 @@
     filters_base_dir: "/var/log/CDT_Project/Filters"
 
   tasks:
-
     # ============================================================
-    # 1. Display variables received from AWX
+    # Display variables received from the AWX survey
     # ============================================================
 
     - name: Display variables received from AWX
@@ -23,14 +22,12 @@
           - "============================================================"
           - "              CDT TARGET SELECTION INPUT"
           - "============================================================"
-          - "Job ID           : {{ job_id | default('NOT RECEIVED') }}"
-          - "Selected CMA     : {{ selected_cma_name | default('NOT RECEIVED') }}"
-          - "Selected targets : {{ selected_targets | default([]) }}"
+          - "Job ID                  : {{ job_id | default('NOT RECEIVED') }}"
+          - "Selected target choices : {{ selected_target_choices | default([]) }}"
           - "============================================================"
 
-
     # ============================================================
-    # 2. Validate AWX variables
+    # Validate and normalize the AWX survey inputs
     # ============================================================
 
     - name: Validate Job ID
@@ -40,61 +37,209 @@
           - job_id | string | trim | length > 0
           - job_id is match('^[A-Za-z0-9_-]+$')
         fail_msg: >-
-          Invalid or missing job_id.
-          Enter the Job ID in the AWX Target Selection survey.
-          Only letters, numbers, underscores and hyphens are allowed.
+          Invalid or missing job_id. Enter the Job ID in the
+          Targets Selection survey. Only letters, numbers,
+          underscores and hyphens are allowed.
 
-
-    - name: Validate selected CMA
+    - name: Require selected target choices
       ansible.builtin.assert:
         that:
-          - selected_cma_name is defined
-          - selected_cma_name | string | trim | length > 0
-        fail_msg: >-
-          selected_cma_name was not received.
-          The CMA-selection workflow must provide selected_cma_name.
+          - selected_target_choices is defined
+        fail_msg: |
+          selected_target_choices was not received.
 
+          The Targets Selection survey must use this variable name:
+          selected_target_choices
 
-    - name: Validate selected targets
-      ansible.builtin.assert:
-        that:
-          - selected_targets is defined
-          - selected_targets | length > 0
-        fail_msg: >-
-          No Cluster/Gateway was selected.
-          Select at least one target in the AWX survey.
-
-
-    # ============================================================
-    # 3. Normalize variables
-    # ============================================================
-
-    - name: Normalize Job ID and CMA name
+    - name: Normalize Job ID
       ansible.builtin.set_fact:
         normalized_job_id: "{{ job_id | string | trim }}"
-        normalized_cma_name: "{{ selected_cma_name | string | trim }}"
 
-
-    # AWX multiple-choice/multiselect may normally arrive as a list.
-    # This also handles newline-separated strings.
-    - name: Normalize selected targets into a list
+    # AWX multiselect normally supplies a list. The fallback also
+    # handles a newline-separated string.
+    - name: Convert selected target choices to a raw list
       ansible.builtin.set_fact:
-        selected_targets_list: >-
+        selected_target_choices_raw: >-
           {{
-            selected_targets
+            selected_target_choices
             if (
-              selected_targets is sequence
-              and selected_targets is not string
+              selected_target_choices is sequence
+              and selected_target_choices is not string
             )
             else (
-              selected_targets
+              selected_target_choices
               | string
               | split('\n')
-              | reject('equalto', '')
-              | list
             )
           }}
 
+    - name: Trim selected target choices
+      ansible.builtin.set_fact:
+        selected_target_choices_list: >-
+          {{
+            selected_target_choices_raw
+            | map('string')
+            | map('trim')
+            | reject('equalto', '')
+            | list
+          }}
+
+    - name: Require at least one selected target choice
+      ansible.builtin.assert:
+        that:
+          - selected_target_choices_list | length > 0
+        fail_msg: >-
+          No Cluster/Gateway target was selected in the AWX survey.
+
+    # ============================================================
+    # Parse "CMA :: target (type)" survey choices
+    #
+    # Examples:
+    #   CMA2_SMS1 :: CXL201 (Cluster)
+    #   CMA2_SMS1 :: GW301 (Gateway)
+    # ============================================================
+
+    - name: Validate selected target choice format
+      ansible.builtin.assert:
+        that:
+          - item is string
+          - item.count('::') == 1
+          - item is match('^\\s*.+?\\s*::\\s*.+?\\s+\\((Cluster|Gateway)\\)\\s*$')
+        fail_msg: |
+          Invalid target choice:
+          {{ item }}
+
+          Expected format:
+          CMA2_SMS1 :: CXL201 (Cluster)
+          CMA2_SMS1 :: GW301 (Gateway)
+      loop: "{{ selected_target_choices_list }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Initialize parsed target choices
+      ansible.builtin.set_fact:
+        parsed_target_choices: []
+
+    - name: Parse selected target choices
+      ansible.builtin.set_fact:
+        parsed_target_choices: >-
+          {{
+            parsed_target_choices
+            +
+            [
+              {
+                'cma_name': choice_parts[0] | trim,
+                'name': (
+                  target_and_type
+                  | regex_replace('\\s*\\([^)]+\\)\\s*$', '')
+                  | trim
+                ),
+                'type': (
+                  'Cluster'
+                  if (
+                    target_and_type
+                    | regex_replace('^.*\\(', '')
+                    | regex_replace('\\)\\s*$', '')
+                    | trim
+                    | lower
+                  ) == 'cluster'
+                  else 'Gateway'
+                )
+              }
+            ]
+          }}
+      vars:
+        choice_parts: "{{ item.split('::') }}"
+        target_and_type: "{{ choice_parts[1] | trim }}"
+      loop: "{{ selected_target_choices_list }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Collect embedded CMA names
+      ansible.builtin.set_fact:
+        embedded_cma_names: >-
+          {{
+            parsed_target_choices
+            | map(attribute='cma_name')
+            | unique
+            | list
+          }}
+
+    - name: Require one CMA across all selected choices
+      ansible.builtin.assert:
+        that:
+          - embedded_cma_names | length == 1
+        fail_msg: |
+          The selected choices contain more than one CMA:
+          {{ embedded_cma_names }}
+
+          Select targets belonging to one CMA only.
+
+    - name: Save CMA name embedded in the survey choices
+      ansible.builtin.set_fact:
+        normalized_cma_name: "{{ embedded_cma_names[0] | string | trim }}"
+
+    - name: Validate embedded CMA name
+      ansible.builtin.assert:
+        that:
+          - normalized_cma_name | length > 0
+          - normalized_cma_name is match('^[A-Za-z0-9_.-]+$')
+        fail_msg: >-
+          Invalid CMA name embedded in the selected survey choices:
+          {{ normalized_cma_name }}
+
+    - name: Initialize normalized target list
+      ansible.builtin.set_fact:
+        normalized_targets: []
+
+    - name: Build normalized target list
+      ansible.builtin.set_fact:
+        normalized_targets: >-
+          {{
+            normalized_targets
+            +
+            [
+              {
+                'name': item.name | string | trim,
+                'type': item.type
+              }
+            ]
+          }}
+      loop: "{{ parsed_target_choices }}"
+      loop_control:
+        label: "{{ item.cma_name }} :: {{ item.name }} ({{ item.type }})"
+
+    - name: Validate normalized targets
+      ansible.builtin.assert:
+        that:
+          - normalized_targets | length > 0
+          - item.name | length > 0
+          - item.type in ['Cluster', 'Gateway']
+        fail_msg: >-
+          Failed to normalize selected target {{ item }}.
+      loop: "{{ normalized_targets }}"
+      loop_control:
+        label: "{{ item.name | default('UNKNOWN') }}"
+
+    - name: Remove duplicate targets from this AWX run
+      ansible.builtin.set_fact:
+        normalized_targets: >-
+          {{
+            normalized_targets
+            | unique(attribute='name')
+            | list
+          }}
+
+    - name: Display normalized survey inputs
+      ansible.builtin.debug:
+        msg:
+          - "Normalized Job ID : {{ normalized_job_id }}"
+          - "Embedded CMA      : {{ normalized_cma_name }}"
+          - "Normalized targets: {{ normalized_targets }}"
+
+    # ============================================================
+    # Define Job ID paths
+    # ============================================================
 
     - name: Define Job ID paths
       ansible.builtin.set_fact:
@@ -103,16 +248,14 @@
         selected_targets_file: >-
           {{ filters_base_dir }}/{{ normalized_job_id }}/selected_targets.yml
 
-
     # ============================================================
-    # 4. Check mds_inventory
+    # Check mds_inventory
     # ============================================================
 
     - name: Check mds_inventory file
       ansible.builtin.stat:
         path: "{{ mds_inventory_file }}"
       register: mds_inventory_stat
-
 
     - name: Validate mds_inventory
       ansible.builtin.assert:
@@ -124,9 +267,8 @@
           {{ mds_inventory_file }} does not exist or is empty.
           Run the MDS inventory generation job first.
 
-
     # ============================================================
-    # 5. Read mds_inventory
+    # Read mds_inventory
     # ============================================================
 
     - name: Read CMA inventory
@@ -134,14 +276,12 @@
         src: "{{ mds_inventory_file }}"
       register: mds_inventory_raw
 
-
     - name: Display current CMA inventory
       ansible.builtin.debug:
         msg: "{{ mds_inventory_raw.content | b64decode }}"
 
-
     # ============================================================
-    # 6. Find selected CMA IP
+    # Find selected CMA IP
     #
     # Expected inventory:
     #
@@ -162,7 +302,6 @@
       register: cma_lookup
       changed_when: false
 
-
     - name: Validate CMA lookup result
       ansible.builtin.assert:
         that:
@@ -171,13 +310,12 @@
         fail_msg: >-
           CMA {{ normalized_cma_name }} was not found exactly once in
           {{ mds_inventory_file }}.
-          Check selected_cma_name and the MDS CMA inventory.
-
+          Check the CMA name embedded in selected_target_choices and
+          the MDS CMA inventory.
 
     - name: Save resolved CMA IP
       ansible.builtin.set_fact:
         normalized_cma_ip: "{{ cma_lookup.stdout | trim }}"
-
 
     - name: Validate CMA IPv4 address
       ansible.builtin.assert:
@@ -187,9 +325,8 @@
           Invalid CMA IP {{ normalized_cma_ip }}
           found for CMA {{ normalized_cma_name }}.
 
-
     # ============================================================
-    # 7. Show resolved CMA
+    # Show resolved CMA
     # ============================================================
 
     - name: Display resolved CMA information
@@ -202,9 +339,8 @@
           - "CMA IP   : {{ normalized_cma_ip }}"
           - "============================================================"
 
-
     # ============================================================
-    # 8. Create Job ID directory
+    # Create Job ID directory
     #
     # Example:
     # /var/log/CDT_Project/Filters/CHG0012345/
@@ -216,9 +352,8 @@
         state: directory
         mode: "0750"
 
-
     # ============================================================
-    # 9. Check whether selected_targets.yml already exists
+    # Check whether selected_targets.yml already exists
     # ============================================================
 
     - name: Check selected_targets.yml
@@ -226,9 +361,8 @@
         path: "{{ selected_targets_file }}"
       register: selected_targets_stat
 
-
     # ============================================================
-    # 10. Read existing selected_targets.yml
+    # Read existing selected_targets.yml
     # ============================================================
 
     - name: Read existing selected_targets.yml
@@ -237,7 +371,6 @@
       register: existing_targets_raw
       when:
         - selected_targets_stat.stat.exists
-
 
     - name: Parse existing selected_targets.yml
       ansible.builtin.set_fact:
@@ -250,9 +383,8 @@
       when:
         - selected_targets_stat.stat.exists
 
-
     # ============================================================
-    # 11. Initialize a new Job ID
+    # Initialize a new Job ID
     # ============================================================
 
     - name: Initialize new Job ID data
@@ -266,9 +398,8 @@
       when:
         - not selected_targets_stat.stat.exists
 
-
     # ============================================================
-    # 12. Validate existing selected_targets.yml
+    # Validate existing selected_targets.yml
     # ============================================================
 
     - name: Validate existing selected_targets.yml structure
@@ -282,7 +413,6 @@
           Existing file {{ selected_targets_file }} does not have
           the expected selected_targets.yml structure.
 
-
     - name: Validate selected_targets.yml Job ID
       ansible.builtin.assert:
         that:
@@ -293,138 +423,8 @@
           {{ existing_data.job_id | default('UNKNOWN') }},
           but current Job ID is {{ normalized_job_id }}.
 
-
     # ============================================================
-    # 13. Normalize selected target information
-    #
-    # Supported:
-    #
-    # CXL103 (Cluster)
-    # GW201 (Gateway)
-    #
-    # Also supported:
-    #
-    # CXL103|Cluster
-    # GW201|Gateway
-    # ============================================================
-
-    - name: Initialize normalized target list
-      ansible.builtin.set_fact:
-        normalized_targets: []
-
-
-    # ------------------------------------------------------------
-    # Format 1:
-    # CXL103|Cluster
-    # ------------------------------------------------------------
-
-    - name: Parse pipe-format targets
-      ansible.builtin.set_fact:
-        normalized_targets: >-
-          {{
-            normalized_targets
-            +
-            [
-              {
-                'name': item.split('|')[0] | trim,
-                'type': item.split('|')[1] | trim
-              }
-            ]
-          }}
-      loop: "{{ selected_targets_list }}"
-      loop_control:
-        label: "{{ item }}"
-      when:
-        - "'|' in item"
-        - item.split('|') | length >= 2
-
-
-    # ------------------------------------------------------------
-    # Format 2:
-    # CXL103 (Cluster)
-    # ------------------------------------------------------------
-
-    - name: Parse display-format targets
-      ansible.builtin.set_fact:
-        normalized_targets: >-
-          {{
-            normalized_targets
-            +
-            [
-              {
-                'name':
-                  (
-                    item
-                    | regex_replace(
-                        '\\s*\\([^)]*\\)\\s*$',
-                        ''
-                      )
-                    | trim
-                  ),
-                'type':
-                  (
-                    item
-                    | regex_replace(
-                        '^.*\\(([^)]*)\\)\\s*$',
-                        '\\1'
-                      )
-                    | trim
-                  )
-              }
-            ]
-          }}
-      loop: "{{ selected_targets_list }}"
-      loop_control:
-        label: "{{ item }}"
-      when:
-        - "'|' not in item"
-        - item is match('^.+\\s+\\([^)]+\\)\\s*$')
-
-
-    # ============================================================
-    # 14. Validate parsed targets
-    # ============================================================
-
-    - name: Validate normalized target list
-      ansible.builtin.assert:
-        that:
-          - normalized_targets | length > 0
-        fail_msg: >-
-          The selected targets could not be parsed.
-          Expected:
-          CXL103 (Cluster)
-          GW201 (Gateway)
-
-
-    - name: Validate target type
-      ansible.builtin.assert:
-        that:
-          - item.name | string | trim | length > 0
-          - item.type | lower in ['cluster', 'gateway']
-        fail_msg: >-
-          Invalid target {{ item }}.
-          Target type must be Cluster or Gateway.
-      loop: "{{ normalized_targets }}"
-      loop_control:
-        label: "{{ item.name | default('UNKNOWN') }}"
-
-
-    # ============================================================
-    # 15. Remove duplicate selections from this AWX run
-    # ============================================================
-
-    - name: Remove duplicate targets
-      ansible.builtin.set_fact:
-        normalized_targets: >-
-          {{
-            normalized_targets
-            | unique(attribute='name')
-            | list
-          }}
-
-
-    # ============================================================
-    # 16. Search for selected CMA in existing Job
+    # Search for selected CMA in existing Job
     # ============================================================
 
     - name: Find selected CMA in existing Job
@@ -441,7 +441,6 @@
             | list
           }}
 
-
     - name: Validate CMA is not duplicated in existing file
       ansible.builtin.assert:
         that:
@@ -451,9 +450,8 @@
           {{ selected_targets_file }}.
           Correct the existing file before continuing.
 
-
     # ============================================================
-    # 17. Validate existing CMA IP
+    # Validate existing CMA IP
     # ============================================================
 
     - name: Validate existing CMA IP
@@ -469,9 +467,8 @@
       when:
         - matching_cmas | length == 1
 
-
     # ============================================================
-    # 18. EXISTING CMA
+    # EXISTING CMA
     #
     # Same Job ID + Same CMA
     # -> append newly selected targets
@@ -486,7 +483,6 @@
           }}
       when:
         - matching_cmas | length == 1
-
 
     - name: Merge targets for existing CMA
       ansible.builtin.set_fact:
@@ -503,7 +499,6 @@
       when:
         - matching_cmas | length == 1
 
-
     - name: Remove current CMA from temporary CMA list
       ansible.builtin.set_fact:
         cmas_without_current: >-
@@ -518,7 +513,6 @@
           }}
       when:
         - matching_cmas | length == 1
-
 
     - name: Add updated CMA back into CMA list
       ansible.builtin.set_fact:
@@ -537,9 +531,8 @@
       when:
         - matching_cmas | length == 1
 
-
     # ============================================================
-    # 19. NEW CMA
+    # NEW CMA
     #
     # Same Job ID + Different CMA
     # -> append new CMA
@@ -563,9 +556,8 @@
       when:
         - matching_cmas | length == 0
 
-
     # ============================================================
-    # 20. Build final data structure
+    # Build final data structure
     # ============================================================
 
     - name: Build final selected_targets data
@@ -577,9 +569,8 @@
           updated_at: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
           selected_cmas: "{{ updated_cmas }}"
 
-
     # ============================================================
-    # 21. Back up existing file
+    # Back up existing file
     # ============================================================
 
     - name: Back up existing selected_targets.yml
@@ -594,9 +585,8 @@
       when:
         - selected_targets_stat.stat.exists
 
-
     # ============================================================
-    # 22. Write selected_targets.yml
+    # Write selected_targets.yml
     # ============================================================
 
     - name: Write selected_targets.yml
@@ -606,16 +596,14 @@
         content: |
           {{ final_data | to_nice_yaml(indent=2, sort_keys=false) }}
 
-
     # ============================================================
-    # 23. Read saved file back for verification
+    # Read saved file back for verification
     # ============================================================
 
     - name: Read saved selected_targets.yml
       ansible.builtin.slurp:
         src: "{{ selected_targets_file }}"
       register: saved_targets_raw
-
 
     - name: Parse saved selected_targets.yml
       ansible.builtin.set_fact:
@@ -626,9 +614,8 @@
             | from_yaml
           }}
 
-
     # ============================================================
-    # 24. Validate finished file
+    # Validate finished file
     # ============================================================
 
     - name: Validate finished selected_targets.yml
@@ -642,9 +629,8 @@
           selected_targets.yml was written but failed
           final validation.
 
-
     # ============================================================
-    # 25. Display final Job summary
+    # Display final Job summary
     # ============================================================
 
     - name: Display final Job summary
@@ -660,10 +646,9 @@
           - "CMA IP      : {{ normalized_cma_ip }}"
           - "============================================================"
 
-
     # ============================================================
-    # 26. Display every CMA and target currently associated
-    #     with this Job ID
+    # Display every CMA and target currently associated
+    # with this Job ID
     # ============================================================
 
     - name: Display targets grouped by CMA
@@ -678,9 +663,8 @@
       loop_control:
         label: "{{ item.cma_name }}"
 
-
     # ============================================================
-    # 27. Display final YAML
+    # Display final YAML
     # ============================================================
 
     - name: Display final selected_targets.yml
