@@ -1,37 +1,31 @@
 ---
-- name: Generate Cluster and Gateway Inventory and Refresh AWX Survey
+- name: Generate CDT candidate inventory and update Job Template 12 Survey
   hosts: all
   gather_facts: false
 
   vars:
-    # =========================================================
-    # MDS and inventory configuration
-    # =========================================================
-
     ansible_python_interpreter: /usr/bin/python3
 
+    # =========================================================
+    # MDS and CDT paths
+    # =========================================================
+
     mds_inventory_file: /var/log/CDT_Project/Inventory/mds_inventory
+
     cdt_inventory_directory: /var/log/CDT_Project/Inventory
-    cma_inventory_suffix: "_inventory.csv"
+
+    deployment_plan_file: /var/log/CDT_Project/Deployment_Plans/inventory.xml
 
     # =========================================================
     # Target AWX Job Template
-    #
-    # Job Template 12 will receive the multiple-selection survey.
-    # This can be overridden through Extra Variables.
     # =========================================================
 
-    target_job_template_id: >-
-      {{
-        cdt_target_template_id
-        | default(12, true)
-        | int
-      }}
+    target_job_template_id: 12
 
     # =========================================================
     # AWX API configuration
     #
-    # Injected through the custom AWX API credential:
+    # Supplied by the custom AWX API credential:
     #
     # AWX_CONTROLLER_URL
     # AWX_OAUTH_TOKEN
@@ -62,10 +56,10 @@
   tasks:
 
     # =========================================================
-    # 1. Validate the CMA Survey input
+    # 1. Validate selected CMA from Job Template 11 Survey
     # =========================================================
 
-    - name: Verify selected CMA was provided
+    - name: Require selected CMA name
       ansible.builtin.assert:
         that:
           - selected_cma_name is defined
@@ -73,8 +67,9 @@
         fail_msg: |
           No CMA was selected.
 
-          Launch this Job Template from its AWX Survey and select
-          one CMA using the variable:
+          Launch this Job Template through the CMA Survey.
+
+          Required Survey variable:
 
           selected_cma_name
         success_msg: >-
@@ -82,43 +77,16 @@
 
     - name: Normalize selected CMA name
       ansible.builtin.set_fact:
-        selected_cma_name_normalized: "{{ selected_cma_name | trim }}"
+        selected_cma_name_normalized: >-
+          {{
+            selected_cma_name
+            | string
+            | trim
+          }}
 
 
     # =========================================================
-    # 2. Validate AWX API configuration
-    # =========================================================
-
-    - name: Validate AWX API settings
-      ansible.builtin.assert:
-        that:
-          - awx_controller_url | length > 0
-          - awx_oauth_token | length > 0
-          - target_job_template_id | int > 0
-        fail_msg: |
-          AWX API configuration is incomplete.
-
-          Confirm that the custom AWX API credential is attached
-          and injects:
-
-          AWX_CONTROLLER_URL
-          AWX_OAUTH_TOKEN
-
-          The target Job Template ID is expected to be 12.
-        success_msg: >-
-          AWX API configuration is available.
-
-    - name: Display safe configuration summary
-      ansible.builtin.debug:
-        msg:
-          - "Selected CMA: {{ selected_cma_name_normalized }}"
-          - "AWX controller: {{ awx_controller_url }}"
-          - "Target Job Template ID: {{ target_job_template_id }}"
-          - "OAuth token available: {{ (awx_oauth_token | length > 0) | bool }}"
-
-
-    # =========================================================
-    # 3. Validate and read the MDS inventory
+    # 2. Validate MDS inventory file
     # =========================================================
 
     - name: Check MDS inventory file
@@ -126,7 +94,7 @@
         path: "{{ mds_inventory_file }}"
       register: mds_inventory_stat
 
-    - name: Require the MDS inventory file
+    - name: Require MDS inventory file
       ansible.builtin.assert:
         that:
           - mds_inventory_stat.stat.exists | default(false)
@@ -138,14 +106,26 @@
           {{ mds_inventory_file }}
 
           Run the MDS inventory-generation Job Template first.
-        success_msg: "MDS inventory file is available."
+        success_msg: >-
+          MDS inventory file is available.
+
+
+    # =========================================================
+    # 3. Read MDS inventory
+    #
+    # Expected format:
+    #
+    # CMA1_Pri_SMS 172.20.50.31
+    # CMA2_SMS1    172.20.50.41
+    # CMA3_SMS1    172.20.50.42
+    # =========================================================
 
     - name: Read MDS inventory file
       ansible.builtin.slurp:
         src: "{{ mds_inventory_file }}"
       register: mds_inventory_raw
 
-    - name: Decode MDS inventory content
+    - name: Decode MDS inventory
       ansible.builtin.set_fact:
         mds_inventory_content: >-
           {{
@@ -156,16 +136,10 @@
 
 
     # =========================================================
-    # 4. Find the selected CMA without a regular expression
-    #
-    # Expected mds_inventory:
-    #
-    # CMA1_Pri_SMS 172.20.50.31
-    # CMA2_SMS1    172.20.50.41
-    # CMA3_SMS1    172.20.50.42
+    # 4. Find selected CMA and its IP
     # =========================================================
 
-    - name: Initialize CMA matches
+    - name: Initialize selected CMA matches
       ansible.builtin.set_fact:
         selected_cma_matches: []
 
@@ -178,8 +152,7 @@
             [
               {
                 'name': item.split()[0],
-                'ip': item.split()[1],
-                'line': item | trim
+                'ip': item.split()[1]
               }
             ]
           }}
@@ -192,63 +165,78 @@
         - item.split() | length == 2
         - item.split()[0] == selected_cma_name_normalized
 
-    - name: Require exactly one matching CMA
+    - name: Require exactly one selected CMA match
       ansible.builtin.assert:
         that:
           - selected_cma_matches | length == 1
         fail_msg: |
-          Expected exactly one inventory entry for:
+          Expected exactly one entry for CMA:
 
           {{ selected_cma_name_normalized }}
 
-          Matching entries:
+          Matches found:
+
           {{ selected_cma_matches | length }}
 
           Current MDS inventory:
 
           {{ mds_inventory_content }}
-
-          Regenerate the MDS inventory and refresh the CMA Survey.
         success_msg: >-
-          Found exactly one entry for
-          {{ selected_cma_name_normalized }}.
+          Found one entry for {{ selected_cma_name_normalized }}.
 
     - name: Set selected CMA information
       ansible.builtin.set_fact:
         selected_cma:
           name: "{{ selected_cma_matches[0].name }}"
           ip: "{{ selected_cma_matches[0].ip }}"
-        selected_cma_ip: "{{ selected_cma_matches[0].ip }}"
 
     - name: Validate selected CMA IP
       ansible.builtin.assert:
         that:
-          - selected_cma_ip is match('^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
-        fail_msg: >-
+          - selected_cma.ip is match('^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+        fail_msg: |
           Invalid IP address for {{ selected_cma.name }}:
-          {{ selected_cma_ip }}
+
+          {{ selected_cma.ip }}
         success_msg: >-
           CMA {{ selected_cma.name }} resolved to
-          {{ selected_cma_ip }}.
+          {{ selected_cma.ip }}.
+
+    - name: Display selected CMA
+      ansible.builtin.debug:
+        msg:
+          - "CMA name: {{ selected_cma.name }}"
+          - "CMA IP: {{ selected_cma.ip }}"
 
 
     # =========================================================
-    # 5. Define the per-CMA cluster/gateway inventory
-    #
-    # Example:
-    #
-    # /var/log/CDT_Project/Inventory/CMA2_SMS1_inventory.csv
+    # 5. Define CDT input and output values
     # =========================================================
 
-    - name: Define CMA inventory output file
+    - name: Define CDT generation values
       ansible.builtin.set_fact:
+        cdt_session_name: "{{ selected_cma.name }}_session"
+
         cma_inventory_file: >-
           {{
             cdt_inventory_directory
             ~ '/'
             ~ selected_cma.name
-            ~ cma_inventory_suffix
+            ~ '_inventory.csv'
           }}
+
+    - name: Display CDT generation values
+      ansible.builtin.debug:
+        msg:
+          - "Session: {{ cdt_session_name }}"
+          - "Candidates file: {{ cma_inventory_file }}"
+          - "Deployment plan: {{ deployment_plan_file }}"
+          - "Server: {{ selected_cma.ip }}"
+
+
+    # =========================================================
+    # 6. Validate required output directories and deployment plan
+    # =========================================================
 
     - name: Ensure CDT inventory directory exists
       ansible.builtin.file:
@@ -256,700 +244,607 @@
         state: directory
         mode: "0755"
 
-    - name: Display selected CMA and output file
+    - name: Check deployment plan
+      ansible.builtin.stat:
+        path: "{{ deployment_plan_file }}"
+      register: deployment_plan_stat
+
+    - name: Require deployment plan
+      ansible.builtin.assert:
+        that:
+          - deployment_plan_stat.stat.exists | default(false)
+          - deployment_plan_stat.stat.isreg | default(false)
+          - deployment_plan_stat.stat.size | default(0) | int > 0
+        fail_msg: |
+          The required CDT deployment plan is missing or empty:
+
+          {{ deployment_plan_file }}
+        success_msg: >-
+          CDT deployment plan is available.
+
+
+    # =========================================================
+    # 7. Remove stale generated inventory
+    #
+    # This ensures that a failed CDT run cannot leave an old file
+    # that appears to be a successful new result.
+    # =========================================================
+
+    - name: Remove stale CMA candidate inventory
+      ansible.builtin.file:
+        path: "{{ cma_inventory_file }}"
+        state: absent
+
+
+    # =========================================================
+    # 8. Build exact CentralDeploymentTool login-shell command
+    #
+    # Required operation:
+    #
+    # mdsenv CMA_Name
+    #
+    # $CDTDIR/CentralDeploymentTool -generate
+    #   -session=CMA_Name_session
+    #   -candidates=CMA_Name_inventory.csv
+    #   -deploymentplan=inventory.xml
+    #   -server=CMA_IP
+    # =========================================================
+
+    - name: Build CentralDeploymentTool login-shell command
+      ansible.builtin.set_fact:
+        cdt_login_shell_command: |
+          echo "===== CHECK POINT LOGIN SHELL ====="
+          echo "User: $(whoami)"
+          echo "Selected CMA: {{ selected_cma.name }}"
+          echo "Selected CMA IP: {{ selected_cma.ip }}"
+
+          if [ ! -f /etc/profile.d/CP.sh ]; then
+              echo "ERROR: /etc/profile.d/CP.sh was not found" >&2
+              exit 20
+          fi
+
+          source /etc/profile.d/CP.sh
+          PROFILE_RC=$?
+
+          echo "Check Point profile return code: ${PROFILE_RC}"
+
+          if [ "${PROFILE_RC}" -ne 0 ]; then
+              echo "ERROR: Failed to load the Check Point profile" >&2
+              exit 21
+          fi
+
+          if ! command -v mdsenv >/dev/null 2>&1; then
+              echo "ERROR: mdsenv command was not found" >&2
+              exit 22
+          fi
+
+          echo "Switching to CMA: {{ selected_cma.name }}"
+
+          mdsenv {{ selected_cma.name | quote }}
+          MDSENV_RC=$?
+
+          echo "mdsenv return code: ${MDSENV_RC}"
+
+          if [ "${MDSENV_RC}" -ne 0 ]; then
+              echo "ERROR: mdsenv failed for {{ selected_cma.name }}" >&2
+              exit 23
+          fi
+
+          echo "FWDIR=${FWDIR:-NOT_SET}"
+          echo "MDSDIR=${MDSDIR:-NOT_SET}"
+          echo "CDTDIR=${CDTDIR:-NOT_SET}"
+
+          if [ -z "${CDTDIR:-}" ]; then
+              echo "ERROR: CDTDIR is not set after loading the login shell" >&2
+              exit 24
+          fi
+
+          if [ ! -x "${CDTDIR}/CentralDeploymentTool" ]; then
+              echo "ERROR: CentralDeploymentTool was not found at:" >&2
+              echo "${CDTDIR}/CentralDeploymentTool" >&2
+              exit 25
+          fi
+
+          echo "===== RUNNING CENTRAL DEPLOYMENT TOOL ====="
+
+          "${CDTDIR}/CentralDeploymentTool" -generate \
+            -session={{ cdt_session_name | quote }} \
+            -candidates={{ cma_inventory_file | quote }} \
+            -deploymentplan={{ deployment_plan_file | quote }} \
+            -server={{ selected_cma.ip | quote }}
+
+          CDT_RC=$?
+
+          echo "CentralDeploymentTool return code: ${CDT_RC}"
+
+          exit "${CDT_RC}"
+
+
+    # =========================================================
+    # 9. Run CentralDeploymentTool in a real Bash login shell
+    #
+    # argv keeps the complete command as the single value
+    # following Bash -c.
+    # =========================================================
+
+    - name: Generate CMA candidate inventory in login shell
+      ansible.builtin.command:
+        argv:
+          - /bin/bash
+          - -l
+          - -c
+          - "{{ cdt_login_shell_command }}"
+      register: cdt_generation_result
+      changed_when: true
+      failed_when: false
+
+
+    # =========================================================
+    # 10. Display CentralDeploymentTool output
+    # =========================================================
+
+    - name: Display CentralDeploymentTool result
+      ansible.builtin.debug:
+        msg: |
+          Return code:
+          {{ cdt_generation_result.rc }}
+
+          STDOUT:
+          {{ cdt_generation_result.stdout | default('') }}
+
+          STDERR:
+          {{ cdt_generation_result.stderr | default('') }}
+
+
+    # =========================================================
+    # 11. Require successful CentralDeploymentTool generation
+    # =========================================================
+
+    - name: Require successful CentralDeploymentTool generation
+      ansible.builtin.assert:
+        that:
+          - cdt_generation_result.rc | int == 0
+        fail_msg: |
+          CentralDeploymentTool inventory generation failed.
+
+          CMA:
+          {{ selected_cma.name }}
+
+          CMA IP:
+          {{ selected_cma.ip }}
+
+          Session:
+          {{ cdt_session_name }}
+
+          Return code:
+          {{ cdt_generation_result.rc }}
+
+          STDOUT:
+          {{ cdt_generation_result.stdout | default('') }}
+
+          STDERR:
+          {{ cdt_generation_result.stderr | default('') }}
+        success_msg: >-
+          CentralDeploymentTool generated the candidate inventory.
+
+
+    # =========================================================
+    # 12. Validate generated inventory
+    # =========================================================
+
+    - name: Check generated CMA candidate inventory
+      ansible.builtin.stat:
+        path: "{{ cma_inventory_file }}"
+      register: cma_inventory_stat
+
+    - name: Require generated CMA candidate inventory
+      ansible.builtin.assert:
+        that:
+          - cma_inventory_stat.stat.exists | default(false)
+          - cma_inventory_stat.stat.isreg | default(false)
+          - cma_inventory_stat.stat.size | default(0) | int > 0
+        fail_msg: |
+          CentralDeploymentTool completed, but the candidate file
+          is missing or empty:
+
+          {{ cma_inventory_file }}
+        success_msg: >-
+          Generated candidate inventory is available.
+
+
+    # =========================================================
+    # 13. Read generated CentralDeploymentTool inventory
+    #
+    # Relevant table:
+    #
+    # Gateway Name, Cluster Name, IP Address, ...
+    # GW101,        CXL103,       172.20.50.101, ...
+    # GW102,        CXL103,       172.20.50.102, ...
+    # R8120GW201,   N/A,          172.20.50.201, ...
+    # =========================================================
+
+    - name: Read generated CMA candidate inventory
+      ansible.builtin.slurp:
+        src: "{{ cma_inventory_file }}"
+      register: generated_inventory_raw
+
+    - name: Decode generated CMA candidate inventory
+      ansible.builtin.set_fact:
+        generated_inventory_content: >-
+          {{
+            generated_inventory_raw.content
+            | b64decode
+            | trim
+          }}
+
+    - name: Display generated CMA candidate inventory
+      ansible.builtin.debug:
+        msg: |
+          Generated inventory:
+
+          {{ generated_inventory_content }}
+
+
+    # =========================================================
+    # 14. Extract cluster names and standalone gateway names
+    #
+    # Rules:
+    #
+    # Cluster Name != N/A:
+    #   use Cluster Name once
+    #   type = Cluster
+    #
+    # Cluster Name == N/A:
+    #   use Gateway Name
+    #   type = Gateway
+    #
+    # A valid candidate row is identified by an IPv4 address in
+    # the third comma-separated field.
+    # =========================================================
+
+    - name: Initialize discovered target choices
+      ansible.builtin.set_fact:
+        discovered_target_choices: []
+
+    - name: Extract target choices from CDT candidate inventory
+      ansible.builtin.set_fact:
+        discovered_target_choices: >-
+          {{
+            discovered_target_choices
+            +
+            [
+              (
+                item.split(',')[1] | trim
+                ~ ' (Cluster)'
+              )
+              if (
+                item.split(',')[1] | trim | upper
+              ) != 'N/A'
+              else
+              (
+                item.split(',')[0] | trim
+                ~ ' (Gateway)'
+              )
+            ]
+          }}
+      loop: "{{ generated_inventory_content.splitlines() }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - item.split(',') | length >= 3
+        - item.split(',')[2] | trim is match('^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+        - item.split(',')[0] | trim | length > 0
+        - item.split(',')[1] | trim | length > 0
+
+
+    # =========================================================
+    # 15. Remove duplicate cluster names
+    #
+    # GW101 and GW102 both belong to CXL103, so the Survey gets:
+    #
+    # CXL103 (Cluster)
+    #
+    # only once.
+    # =========================================================
+
+    - name: Build unique sorted target choices
+      ansible.builtin.set_fact:
+        target_survey_choices: >-
+          {{
+            discovered_target_choices
+            | unique
+            | sort
+            | list
+          }}
+
+    - name: Require target Survey choices
+      ansible.builtin.assert:
+        that:
+          - target_survey_choices | length > 0
+        fail_msg: |
+          No clusters or standalone gateways were extracted from:
+
+          {{ cma_inventory_file }}
+
+          Generated inventory:
+
+          {{ generated_inventory_content }}
+        success_msg: >-
+          Extracted {{ target_survey_choices | length }}
+          unique target choices.
+
+    - name: Build newline-delimited Survey choices
+      ansible.builtin.set_fact:
+        target_survey_choices_text: >-
+          {{
+            target_survey_choices
+            | join('\n')
+          }}
+
+    - name: Display target Survey choices
       ansible.builtin.debug:
         msg:
+          - "Target Job Template ID: {{ target_job_template_id }}"
+          - "Choice count: {{ target_survey_choices | length }}"
+          - "Choices: {{ target_survey_choices }}"
+
+
+    # =========================================================
+    # 16. Validate AWX API configuration
+    # =========================================================
+
+    - name: Validate AWX API configuration
+      ansible.builtin.assert:
+        that:
+          - awx_controller_url | length > 0
+          - awx_oauth_token | length > 0
+          - target_job_template_id | int == 12
+        fail_msg: |
+          AWX API configuration is incomplete.
+
+          Confirm the attached AWX API credential injects:
+
+          AWX_CONTROLLER_URL
+          AWX_OAUTH_TOKEN
+        success_msg: >-
+          AWX API configuration is available.
+
+    - name: Display safe AWX API configuration
+      ansible.builtin.debug:
+        msg:
+          - "AWX controller: {{ awx_controller_url }}"
+          - "Target Job Template ID: {{ target_job_template_id }}"
+          - "OAuth token available: {{ (awx_oauth_token | length > 0) | bool }}"
+
+
+    # =========================================================
+    # 17. Test AWX API
+    # =========================================================
+
+    - name: Test AWX API root
+      ansible.builtin.uri:
+        url: "{{ awx_controller_url }}/api/v2/"
+        method: GET
+        validate_certs: "{{ awx_validate_certs }}"
+        return_content: false
+        status_code: 200
+      delegate_to: localhost
+      run_once: true
+      register: awx_api_test
+      changed_when: false
+
+
+    # =========================================================
+    # 18. Verify Job Template 12 access
+    # =========================================================
+
+    - name: Check authenticated access to Job Template 12
+      ansible.builtin.uri:
+        url: >-
+          {{ awx_controller_url }}/api/v2/job_templates/{{ target_job_template_id }}/
+        method: GET
+        headers:
+          Authorization: "Bearer {{ awx_oauth_token }}"
+          Accept: "application/json"
+        validate_certs: "{{ awx_validate_certs }}"
+        return_content: false
+        status_code:
+          - 200
+          - 401
+          - 403
+          - 404
+      delegate_to: localhost
+      run_once: true
+      register: target_template_test
+      changed_when: false
+      no_log: true
+
+    - name: Display Job Template access status
+      ansible.builtin.debug:
+        msg:
+          - "Job Template status: {{ target_template_test.status }}"
+          - "Target Job Template ID: {{ target_job_template_id }}"
+
+    - name: Require access to Job Template 12
+      ansible.builtin.assert:
+        that:
+          - target_template_test.status | int == 200
+        fail_msg: |
+          Unable to access Job Template 12.
+
+          HTTP status:
+          {{ target_template_test.status }}
+
+          401 = OAuth token is invalid or expired.
+          403 = Token owner lacks permission.
+          404 = Job Template 12 was not found.
+        success_msg: >-
+          Job Template 12 is accessible.
+
+
+    # =========================================================
+    # 19. Update Job Template 12 multiselect Survey
+    #
+    # Survey choices:
+    #
+    # CXL103 (Cluster)
+    # R8120GW201 (Gateway)
+    #
+    # The Survey variable presented to Job Template 12 is:
+    #
+    # selected_target_choices
+    # =========================================================
+
+    - name: Update multiselect Survey on Job Template 12
+      ansible.builtin.uri:
+        url: >-
+          {{ awx_controller_url }}/api/v2/job_templates/{{ target_job_template_id }}/survey_spec/
+        method: POST
+        headers:
+          Authorization: "Bearer {{ awx_oauth_token }}"
+          Accept: "application/json"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "Cluster and Gateway Selection"
+          description: >-
+            Select one or more clusters or gateways from
+            {{ selected_cma.name }}.
+          spec:
+            - question_name: "Select Cluster / Gateway"
+              question_description: >-
+                Select one or more targets for the CDT operation.
+              required: true
+              type: "multiselect"
+              variable: "selected_target_choices"
+              choices: "{{ target_survey_choices_text }}"
+              default: ""
+        validate_certs: "{{ awx_validate_certs }}"
+        return_content: false
+        status_code:
+          - 200
+          - 201
+          - 400
+          - 401
+          - 403
+          - 404
+      delegate_to: localhost
+      run_once: true
+      register: survey_update_result
+      no_log: true
+
+    - name: Display Survey update status
+      ansible.builtin.debug:
+        msg:
+          - "Survey update status: {{ survey_update_result.status }}"
+          - "Target Job Template ID: {{ target_job_template_id }}"
+
+    - name: Require successful Survey update
+      ansible.builtin.assert:
+        that:
+          - survey_update_result.status | int in [200, 201]
+        fail_msg: |
+          Updating the multiselect Survey on Job Template 12 failed.
+
+          HTTP status:
+          {{ survey_update_result.status }}
+
+          400 = Invalid Survey specification.
+          401 = Invalid or expired OAuth token.
+          403 = Token owner lacks permission.
+          404 = Job Template or Survey endpoint was not found.
+        success_msg: >-
+          Job Template 12 multiselect Survey was updated.
+
+
+    # =========================================================
+    # 20. Enable Survey on Job Template 12
+    # =========================================================
+
+    - name: Enable Survey on Job Template 12
+      ansible.builtin.uri:
+        url: >-
+          {{ awx_controller_url }}/api/v2/job_templates/{{ target_job_template_id }}/
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ awx_oauth_token }}"
+          Accept: "application/json"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          survey_enabled: true
+        validate_certs: "{{ awx_validate_certs }}"
+        return_content: false
+        status_code:
+          - 200
+          - 400
+          - 401
+          - 403
+          - 404
+      delegate_to: localhost
+      run_once: true
+      register: survey_enable_result
+      no_log: true
+
+    - name: Require successful Survey enablement
+      ansible.builtin.assert:
+        that:
+          - survey_enable_result.status | int == 200
+        fail_msg: >-
+          Enabling the Survey on Job Template 12 failed with
+          HTTP status {{ survey_enable_result.status }}.
+        success_msg: >-
+          Survey was enabled on Job Template 12.
+
+
+    # =========================================================
+    # 21. Verify final Job Template 12 Survey
+    # =========================================================
+
+    - name: Retrieve final Survey specification
+      ansible.builtin.uri:
+        url: >-
+          {{ awx_controller_url }}/api/v2/job_templates/{{ target_job_template_id }}/survey_spec/
+        method: GET
+        headers:
+          Authorization: "Bearer {{ awx_oauth_token }}"
+          Accept: "application/json"
+        validate_certs: "{{ awx_validate_certs }}"
+        return_content: true
+        status_code: 200
+      delegate_to: localhost
+      run_once: true
+      register: final_survey_spec
+      changed_when: false
+      no_log: true
+
+    - name: Verify final Survey specification
+      ansible.builtin.assert:
+        that:
+          - final_survey_spec.json is defined
+          - final_survey_spec.json.spec is defined
+          - final_survey_spec.json.spec | length == 1
+          - final_survey_spec.json.spec[0].variable == 'selected_target_choices'
+          - final_survey_spec.json.spec[0].type == 'multiselect'
+          - final_survey_spec.json.spec[0].required | bool
+        fail_msg: >-
+          Job Template 12 does not contain the expected
+          selected_target_choices multiselect Survey.
+        success_msg: >-
+          Job Template 12 multiselect Survey is correct.
+
+
+    # =========================================================
+    # 22. Final summary
+    # =========================================================
+
+    - name: Display final summary
+      ansible.builtin.debug:
+        msg:
+          - "CentralDeploymentTool inventory generated successfully."
           - "CMA name: {{ selected_cma.name }}"
           - "CMA IP: {{ selected_cma.ip }}"
-          - "Inventory file: {{ cma_inventory_file }}"
-
-
-    # =========================================================
-    # 6. Create temporary working directory
-    # =========================================================
-
-    - name: Create temporary discovery directory
-      ansible.builtin.tempfile:
-        state: directory
-        path: /tmp
-        prefix: cdt-target-discovery-
-      register: discovery_temp_directory
-
-
-    # =========================================================
-    # 7. Discover CMA targets and update Job Template 12
-    # =========================================================
-
-    - name: Generate target inventory and refresh AWX Survey
-      block:
-
-        # -----------------------------------------------------
-        # 7.1 Install the discovery script
-        #
-        # This script executes after mdsenv switches to the
-        # selected CMA.
-        # -----------------------------------------------------
-
-        - name: Install cluster and gateway discovery script
-          ansible.builtin.copy:
-            dest: "{{ discovery_temp_directory.path }}/generate_inventory.sh"
-            mode: "0755"
-            content: |
-              #!/bin/bash
-
-              set -o pipefail
-
-              OUTPUT_FILE="{{ cma_inventory_file }}"
-              TEMP_JSON="{{ discovery_temp_directory.path }}/gateways_and_servers.json"
-              TEMP_CSV="{{ discovery_temp_directory.path }}/targets.csv"
-
-              rm -f "${TEMP_JSON}" "${TEMP_CSV}"
-
-              echo "Querying gateways and servers for the active CMA..."
-
-              mgmt_cli show gateways-and-servers \
-                details-level standard \
-                limit 500 \
-                offset 0 \
-                --format json \
-                -r true > "${TEMP_JSON}"
-
-              MGMT_RC=$?
-
-              echo "mgmt_cli return code: ${MGMT_RC}"
-
-              if [ "${MGMT_RC}" -ne 0 ]; then
-                  echo "ERROR: mgmt_cli command failed." >&2
-                  cat "${TEMP_JSON}" >&2
-                  exit 30
-              fi
-
-              if [ ! -s "${TEMP_JSON}" ]; then
-                  echo "ERROR: mgmt_cli returned an empty result." >&2
-                  exit 31
-              fi
-
-              if ! jq -e . "${TEMP_JSON}" >/dev/null 2>&1; then
-                  echo "ERROR: mgmt_cli output is not valid JSON." >&2
-                  cat "${TEMP_JSON}" >&2
-                  exit 32
-              fi
-
-              echo "Name,Type" > "${TEMP_CSV}"
-
-              jq -r '
-                (.objects // [])
-                | .[]
-                | select(
-                    .type == "simple-cluster"
-                    or .type == "CpmiGatewayCluster"
-                    or .type == "cluster"
-                    or .type == "simple-gateway"
-                    or .type == "CpmiHostCkp"
-                    or .type == "gateway"
-                  )
-                | [
-                    (.name // ""),
-                    (
-                      if (
-                        .type == "simple-cluster"
-                        or .type == "CpmiGatewayCluster"
-                        or .type == "cluster"
-                      )
-                      then "Cluster"
-                      else "Gateway"
-                      end
-                    )
-                  ]
-                | select(.[0] != "")
-                | @csv
-              ' "${TEMP_JSON}" \
-                | sort -u >> "${TEMP_CSV}"
-
-              TARGET_COUNT=$(tail -n +2 "${TEMP_CSV}" | wc -l)
-
-              echo "Discovered target count: ${TARGET_COUNT}"
-
-              if [ "${TARGET_COUNT}" -eq 0 ]; then
-                  echo "ERROR: No clusters or gateways were found." >&2
-
-                  echo "Object types returned by mgmt_cli:" >&2
-
-                  jq -r '
-                    (.objects // [])
-                    | .[]
-                    | .type // "unknown"
-                  ' "${TEMP_JSON}" \
-                    | sort -u >&2
-
-                  exit 33
-              fi
-
-              install -m 0644 "${TEMP_CSV}" "${OUTPUT_FILE}"
-
-              echo
-              echo "Generated cluster/gateway inventory:"
-              cat "${OUTPUT_FILE}"
-
-              exit 0
-
-
-        # -----------------------------------------------------
-        # 7.2 Build the login-shell command
-        #
-        # No set -e is used here so diagnostic messages remain
-        # visible if one command fails.
-        # -----------------------------------------------------
-
-        - name: Build CMA login-shell command
-          ansible.builtin.set_fact:
-            cma_login_shell_command: |
-              echo "===== CHECK POINT LOGIN SHELL ====="
-              echo "User: $(whoami)"
-              echo "Shell: ${SHELL:-unknown}"
-              echo "Selected CMA: {{ selected_cma.name }}"
-              echo "Selected CMA IP: {{ selected_cma.ip }}"
-
-              if [ -f /etc/profile.d/CP.sh ]; then
-                  echo "Loading Check Point profile..."
-                  source /etc/profile.d/CP.sh
-                  PROFILE_RC=$?
-                  echo "CP profile return code: ${PROFILE_RC}"
-              else
-                  echo "ERROR: /etc/profile.d/CP.sh was not found"
-                  exit 20
-              fi
-
-              if ! command -v mdsenv >/dev/null 2>&1; then
-                  echo "ERROR: mdsenv command is unavailable"
-                  exit 21
-              fi
-
-              echo "Switching environment to {{ selected_cma.name }}..."
-
-              mdsenv {{ selected_cma.name | quote }}
-              MDSENV_RC=$?
-
-              echo "mdsenv return code: ${MDSENV_RC}"
-
-              if [ "${MDSENV_RC}" -ne 0 ]; then
-                  echo "ERROR: mdsenv failed for {{ selected_cma.name }}"
-                  exit 22
-              fi
-
-              echo "FWDIR=${FWDIR:-NOT_SET}"
-              echo "MDSDIR=${MDSDIR:-NOT_SET}"
-
-              if ! command -v mgmt_cli >/dev/null 2>&1; then
-                  echo "ERROR: mgmt_cli is unavailable after mdsenv"
-                  exit 23
-              fi
-
-              if ! command -v jq >/dev/null 2>&1; then
-                  echo "ERROR: jq is unavailable"
-                  exit 24
-              fi
-
-              echo "mgmt_cli path: $(command -v mgmt_cli)"
-              echo "jq path: $(command -v jq)"
-
-              echo "===== GENERATING TARGET INVENTORY ====="
-
-              /bin/bash {{ (discovery_temp_directory.path ~ '/generate_inventory.sh') | quote }}
-              SCRIPT_RC=$?
-
-              echo "Discovery script return code: ${SCRIPT_RC}"
-
-              exit "${SCRIPT_RC}"
-
-
-        # -----------------------------------------------------
-        # 7.3 Run through a real Bash login shell
-        #
-        # argv keeps the complete command as a single argument
-        # after -c.
-        # -----------------------------------------------------
-
-        - name: Generate cluster and gateway inventory in login shell
-          ansible.builtin.command:
-            argv:
-              - /bin/bash
-              - -l
-              - -c
-              - "{{ cma_login_shell_command }}"
-          register: discovery_result
-          changed_when: true
-          failed_when: false
-
-
-        # -----------------------------------------------------
-        # 7.4 Display command diagnostics
-        # -----------------------------------------------------
-
-        - name: Display discovery command output
-          ansible.builtin.debug:
-            msg: |
-              Return code:
-              {{ discovery_result.rc }}
-
-              STDOUT:
-              {{ discovery_result.stdout | default('') }}
-
-              STDERR:
-              {{ discovery_result.stderr | default('') }}
-
-
-        # -----------------------------------------------------
-        # 7.5 Stop if discovery failed
-        # -----------------------------------------------------
-
-        - name: Verify cluster and gateway discovery succeeded
-          ansible.builtin.assert:
-            that:
-              - discovery_result.rc | int == 0
-            fail_msg: |
-              Cluster/gateway inventory generation failed.
-
-              CMA:
-              {{ selected_cma.name }}
-
-              CMA IP:
-              {{ selected_cma.ip }}
-
-              Return code:
-              {{ discovery_result.rc }}
-
-              STDOUT:
-              {{ discovery_result.stdout | default('') }}
-
-              STDERR:
-              {{ discovery_result.stderr | default('') }}
-            success_msg: >-
-              Cluster/gateway inventory generation succeeded.
-
-
-        # -----------------------------------------------------
-        # 7.6 Verify the generated inventory file
-        # -----------------------------------------------------
-
-        - name: Check generated CMA inventory file
-          ansible.builtin.stat:
-            path: "{{ cma_inventory_file }}"
-          register: generated_inventory_stat
-
-        - name: Verify generated CMA inventory file
-          ansible.builtin.assert:
-            that:
-              - generated_inventory_stat.stat.exists | default(false)
-              - generated_inventory_stat.stat.isreg | default(false)
-              - generated_inventory_stat.stat.size | default(0) | int > 0
-            fail_msg: |
-              The cluster/gateway inventory was not generated:
-
-              {{ cma_inventory_file }}
-            success_msg: >-
-              Cluster/gateway inventory file was generated.
-
-
-        # -----------------------------------------------------
-        # 7.7 Read the generated CSV inventory
-        #
-        # File:
-        #
-        # Name,Type
-        # CXL103,Cluster
-        # GW201,Gateway
-        # -----------------------------------------------------
-
-        - name: Read generated CMA inventory file
-          ansible.builtin.slurp:
-            src: "{{ cma_inventory_file }}"
-          register: generated_inventory_raw
-
-        - name: Decode generated CMA inventory
-          ansible.builtin.set_fact:
-            generated_inventory_content: >-
-              {{
-                generated_inventory_raw.content
-                | b64decode
-                | trim
-              }}
-
-        - name: Display generated CMA inventory
-          ansible.builtin.debug:
-            msg: |
-              Generated inventory:
-
-              {{ generated_inventory_content }}
-
-
-        # -----------------------------------------------------
-        # 7.8 Extract names and types from the inventory
-        # -----------------------------------------------------
-
-        - name: Initialize structured target inventory
-          ansible.builtin.set_fact:
-            cma_targets: []
-
-        - name: Build structured target inventory
-          ansible.builtin.set_fact:
-            cma_targets: >-
-              {{
-                cma_targets
-                +
-                [
-                  {
-                    'name': (
-                      item.split(',')[0]
-                      | regex_replace('^"|"$', '')
-                      | trim
-                    ),
-                    'type': (
-                      item.split(',')[1]
-                      | regex_replace('^"|"$', '')
-                      | trim
-                    )
-                  }
-                ]
-              }}
-          loop: "{{ generated_inventory_content.splitlines()[1:] }}"
-          loop_control:
-            label: "{{ item }}"
-          when:
-            - item | trim | length > 0
-            - item.split(',') | length == 2
-
-        - name: Validate structured target inventory
-          ansible.builtin.assert:
-            that:
-              - cma_targets | length > 0
-              - item.name | length > 0
-              - item.type in ['Cluster', 'Gateway']
-            fail_msg: >-
-              Invalid cluster/gateway inventory entry: {{ item }}
-            quiet: true
-          loop: "{{ cma_targets }}"
-          loop_control:
-            label: "{{ item.name | default('unknown target') }}"
-
-
-        # -----------------------------------------------------
-        # 7.9 Build survey display choices
-        #
-        # Output:
-        #
-        # CXL103 (Cluster)
-        # GW201 (Gateway)
-        # -----------------------------------------------------
-
-        - name: Initialize target Survey choices
-          ansible.builtin.set_fact:
-            target_survey_choices: []
-
-        - name: Build target Survey choices
-          ansible.builtin.set_fact:
-            target_survey_choices: >-
-              {{
-                target_survey_choices
-                +
-                [
-                  item.name ~ ' (' ~ item.type ~ ')'
-                ]
-              }}
-          loop: "{{ cma_targets | sort(attribute='name') }}"
-          loop_control:
-            label: "{{ item.name }}"
-
-        - name: Remove duplicate Survey choices
-          ansible.builtin.set_fact:
-            target_survey_choices: >-
-              {{
-                target_survey_choices
-                | unique
-                | list
-              }}
-
-        - name: Display target Survey choices
-          ansible.builtin.debug:
-            msg:
-              - "Target Job Template ID: {{ target_job_template_id }}"
-              - "Choice count: {{ target_survey_choices | length }}"
-              - "Choices: {{ target_survey_choices }}"
-
-
-        # -----------------------------------------------------
-        # 7.10 Test the AWX API root
-        # -----------------------------------------------------
-
-        - name: Test AWX API root
-          ansible.builtin.uri:
-            url: "{{ awx_controller_url }}/api/v2/"
-            method: GET
-            validate_certs: "{{ awx_validate_certs }}"
-            follow_redirects: safe
-            return_content: false
-            status_code: 200
-          delegate_to: localhost
-          run_once: true
-          register: awx_api_test
-          changed_when: false
-
-        - name: Display AWX API test result
-          ansible.builtin.debug:
-            msg:
-              - "AWX API status: {{ awx_api_test.status }}"
-              - "AWX Controller: {{ awx_controller_url }}"
-
-
-        # -----------------------------------------------------
-        # 7.11 Verify authenticated access to Job Template 12
-        # -----------------------------------------------------
-
-        - name: Check authenticated access to Job Template 12
-          ansible.builtin.uri:
-            url: >-
-              {{ awx_controller_url }}/api/v2/job_templates/{{ target_job_template_id }}/
-            method: GET
-            headers:
-              Authorization: "Bearer {{ awx_oauth_token }}"
-              Accept: "application/json"
-            validate_certs: "{{ awx_validate_certs }}"
-            follow_redirects: safe
-            return_content: false
-            status_code:
-              - 200
-              - 401
-              - 403
-              - 404
-          delegate_to: localhost
-          run_once: true
-          register: target_job_template_test
-          changed_when: false
-          no_log: true
-
-        - name: Display target Job Template API status
-          ansible.builtin.debug:
-            msg:
-              - "Job Template API status: {{ target_job_template_test.status }}"
-              - "Target Job Template ID: {{ target_job_template_id }}"
-
-        - name: Verify access to Job Template 12
-          ansible.builtin.assert:
-            that:
-              - target_job_template_test.status | int == 200
-            fail_msg: |
-              Unable to access Job Template
-              {{ target_job_template_id }}.
-
-              HTTP status:
-              {{ target_job_template_test.status }}
-
-              401 = OAuth token is invalid or expired.
-              403 = Token user lacks permission.
-              404 = Job Template 12 does not exist.
-            success_msg: >-
-              Authenticated access to Job Template 12 succeeded.
-
-
-        # -----------------------------------------------------
-        # 7.12 Update the multiple-selection Survey
-        #
-        # AWX supplies selected_target_choices to Job Template 12.
-        # -----------------------------------------------------
-
-        - name: Update target selection Survey on Job Template 12
-          ansible.builtin.uri:
-            url: >-
-              {{ awx_controller_url }}/api/v2/job_templates/{{ target_job_template_id }}/survey_spec/
-            method: POST
-            headers:
-              Authorization: "Bearer {{ awx_oauth_token }}"
-              Accept: "application/json"
-              Content-Type: "application/json"
-            body_format: json
-            body:
-              name: "Cluster and Gateway Selection"
-              description: >-
-                Select one or more clusters or gateways from
-                {{ selected_cma.name }}.
-              spec:
-                - question_name: "Select Cluster / Gateway"
-                  question_description: >-
-                    Select one or more targets for the CDT operation.
-                  required: true
-                  type: "multiselect"
-                  variable: "selected_target_choices"
-                  choices: "{{ target_survey_choices }}"
-                  default: ""
-            validate_certs: "{{ awx_validate_certs }}"
-            follow_redirects: safe
-            return_content: false
-            status_code:
-              - 200
-              - 201
-              - 400
-              - 401
-              - 403
-              - 404
-          delegate_to: localhost
-          run_once: true
-          register: survey_update_result
-          no_log: true
-
-        - name: Display Survey update status
-          ansible.builtin.debug:
-            msg:
-              - "Survey update HTTP status: {{ survey_update_result.status }}"
-              - "Target Job Template ID: {{ target_job_template_id }}"
-
-        - name: Verify Survey update succeeded
-          ansible.builtin.assert:
-            that:
-              - survey_update_result.status | int in [200, 201]
-            fail_msg: |
-              Updating the Survey on Job Template 12 failed.
-
-              HTTP status:
-              {{ survey_update_result.status }}
-
-              400 = Survey specification is invalid.
-              401 = OAuth token is invalid or expired.
-              403 = Token owner lacks permission.
-              404 = Job Template or survey endpoint was not found.
-            success_msg: >-
-              Multiple-selection Survey was updated successfully.
-
-
-        # -----------------------------------------------------
-        # 7.13 Enable the Survey on Job Template 12
-        # -----------------------------------------------------
-
-        - name: Enable Survey on Job Template 12
-          ansible.builtin.uri:
-            url: >-
-              {{ awx_controller_url }}/api/v2/job_templates/{{ target_job_template_id }}/
-            method: PATCH
-            headers:
-              Authorization: "Bearer {{ awx_oauth_token }}"
-              Accept: "application/json"
-              Content-Type: "application/json"
-            body_format: json
-            body:
-              survey_enabled: true
-            validate_certs: "{{ awx_validate_certs }}"
-            follow_redirects: safe
-            return_content: false
-            status_code:
-              - 200
-              - 400
-              - 401
-              - 403
-              - 404
-          delegate_to: localhost
-          run_once: true
-          register: survey_enable_result
-          no_log: true
-
-        - name: Verify Survey was enabled
-          ansible.builtin.assert:
-            that:
-              - survey_enable_result.status | int == 200
-            fail_msg: >-
-              Enabling the Survey on Job Template 12 failed with
-              HTTP status {{ survey_enable_result.status }}.
-            success_msg: >-
-              Survey was enabled successfully on Job Template 12.
-
-
-        # -----------------------------------------------------
-        # 7.14 Read and verify the final Survey
-        # -----------------------------------------------------
-
-        - name: Retrieve final Survey specification
-          ansible.builtin.uri:
-            url: >-
-              {{ awx_controller_url }}/api/v2/job_templates/{{ target_job_template_id }}/survey_spec/
-            method: GET
-            headers:
-              Authorization: "Bearer {{ awx_oauth_token }}"
-              Accept: "application/json"
-            validate_certs: "{{ awx_validate_certs }}"
-            follow_redirects: safe
-            return_content: true
-            status_code: 200
-          delegate_to: localhost
-          run_once: true
-          register: final_survey_spec
-          changed_when: false
-          no_log: true
-
-        - name: Verify final target Survey
-          ansible.builtin.assert:
-            that:
-              - final_survey_spec.json is defined
-              - final_survey_spec.json.spec is defined
-              - final_survey_spec.json.spec | length > 0
-              - final_survey_spec.json.spec[0].variable == 'selected_target_choices'
-              - final_survey_spec.json.spec[0].type == 'multiselect'
-              - final_survey_spec.json.spec[0].required | bool
-            fail_msg: >-
-              Job Template 12 does not contain the expected
-              selected_target_choices multiselect Survey.
-            success_msg: >-
-              Job Template 12 multiple-selection Survey is correct.
-
-
-        # -----------------------------------------------------
-        # 7.15 Publish structured artifacts
-        # -----------------------------------------------------
-
-        - name: Publish CMA target inventory artifacts
-          ansible.builtin.set_stats:
-            data:
-              selected_cma:
-                name: "{{ selected_cma.name }}"
-                ip: "{{ selected_cma.ip }}"
-
-              cma_target_inventory:
-                cma_name: "{{ selected_cma.name }}"
-                cma_ip: "{{ selected_cma.ip }}"
-                inventory_file: "{{ cma_inventory_file }}"
-                target_count: "{{ cma_targets | length }}"
-                targets: "{{ cma_targets }}"
-
-              target_survey:
-                job_template_id: "{{ target_job_template_id }}"
-                variable: "selected_target_choices"
-                choices: "{{ target_survey_choices }}"
-          per_host: false
-
-
-        # -----------------------------------------------------
-        # 7.16 Final summary
-        # -----------------------------------------------------
-
-        - name: Display final summary
-          ansible.builtin.debug:
-            msg:
-              - "Cluster/gateway discovery completed."
-              - "CMA: {{ selected_cma.name }}"
-              - "CMA IP: {{ selected_cma.ip }}"
-              - "Inventory file: {{ cma_inventory_file }}"
-              - "Discovered target count: {{ cma_targets | length }}"
-              - "Survey Job Template ID: {{ target_job_template_id }}"
-              - "Survey variable: selected_target_choices"
-              - "Survey choices: {{ target_survey_choices }}"
-
-      always:
-
-        # -----------------------------------------------------
-        # 7.17 Always remove temporary files
-        # -----------------------------------------------------
-
-        - name: Remove temporary discovery directory
-          ansible.builtin.file:
-            path: "{{ discovery_temp_directory.path }}"
-            state: absent
-          when:
-            - discovery_temp_directory is defined
-            - discovery_temp_directory.path is defined
+          - "Candidates file: {{ cma_inventory_file }}"
+          - "Target Job Template ID: {{ target_job_template_id }}"
+          - "Survey variable: selected_target_choices"
+          - "Survey choices: {{ target_survey_choices }}"
