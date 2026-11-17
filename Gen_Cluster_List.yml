@@ -616,12 +616,12 @@
     # =========================================================
     # 16. Validate AWX API configuration
     # =========================================================
-- name: Display AWX API credential injection status
-  ansible.builtin.debug:
-    msg:
-      - "AWX Controller URL: {{ awx_controller_url }}"
-      - "AWX OAuth token available: {{ (awx_oauth_token | length > 0) | bool }}"
-      - "Target Job Template ID: {{ target_job_template_id }}"
+    - name: Display AWX API credential injection status
+      ansible.builtin.debug:
+        msg:
+          - "AWX Controller URL: {{ awx_controller_url }}"
+          - "AWX OAuth token available: {{ (awx_oauth_token | length > 0) | bool }}"
+          - "Target Job Template ID: {{ target_job_template_id }}"
 
     - name: Validate AWX API configuration
       ansible.builtin.assert:
