@@ -2,13 +2,15 @@
 - name: Save selected CDT targets by Job ID
   hosts: all
   gather_facts: false
-  become: true
 
   vars:
-    # CMA name-to-IP inventory
+    # Prevent Python interpreter discovery warning.
+    ansible_python_interpreter: /usr/bin/python3
+
+    # CMA name-to-IP inventory.
     mds_inventory_file: "/var/log/CDT_Project/Inventory/mds_inventory"
 
-    # Job-specific target selection directory
+    # Job-specific target selection directory.
     filters_base_dir: "/var/log/CDT_Project/Filters"
 
   tasks:
@@ -81,13 +83,13 @@
     # ============================================================
     # 5. Convert AWX multiselect result to a list
     #
-    # AWX can return:
+    # Supported list:
     #
-    # A list:
+    # selected_target_choices:
     #   - CMA2_SMS1 :: CXL103 (Cluster)
     #   - CMA2_SMS1 :: GW301 (Gateway)
     #
-    # Or a newline-separated string.
+    # A newline-separated string is also supported.
     # ============================================================
 
     - name: Convert selected target choices to a raw list
@@ -138,14 +140,13 @@
     # ============================================================
     # 6. Validate target-choice format
     #
-    # Required:
+    # Required formats:
     #
     # CMA2_SMS1 :: CXL103 (Cluster)
     # CMA2_SMS1 :: GW301 (Gateway)
     #
-    # Important:
-    # The complete assertion containing " :: " is quoted to prevent
-    # YAML from interpreting colon-space as a mapping separator.
+    # Full assertion expressions are quoted because " :: " contains
+    # colon-space, which otherwise causes a YAML parsing error.
     # ============================================================
 
     - name: Validate selected target choice format
@@ -175,7 +176,7 @@
 
 
     # ============================================================
-    # 7. Parse choices without regex
+    # 7. Parse choices without regular expressions
     #
     # Input:
     # CMA2_SMS1 :: CXL103 (Cluster)
@@ -278,8 +279,9 @@
     # ============================================================
     # 9. Determine CMA embedded in survey choices
     #
-    # The survey is generated for one CMA at a time.
-    # All choices in one launch must therefore belong to one CMA.
+    # The survey is dynamically generated for one CMA.
+    # Therefore all selected entries in one launch must have the
+    # same embedded CMA name.
     # ============================================================
 
     - name: Collect embedded CMA names
@@ -305,7 +307,7 @@
           Select targets from one CMA per Target Selection run.
 
           To add targets from another CMA:
-          1. Generate the survey for the other CMA.
+          1. Generate the target survey for the other CMA.
           2. Launch Target Selection again.
           3. Enter the same Job ID.
         success_msg: >-
@@ -393,7 +395,29 @@
 
 
     # ============================================================
-    # 12. Validate mds_inventory
+    # 12. Show remote execution identity
+    #
+    # No sudo/become is used. All following operations run as the
+    # AWX SSH account.
+    # ============================================================
+
+    - name: Check remote execution identity
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/id
+      register: remote_identity
+      changed_when: false
+
+
+    - name: Display remote execution identity
+      ansible.builtin.debug:
+        msg:
+          - "Remote execution identity:"
+          - "{{ remote_identity.stdout }}"
+
+
+    # ============================================================
+    # 13. Validate mds_inventory
     # ============================================================
 
     - name: Check mds_inventory file
@@ -408,18 +432,19 @@
           - "mds_inventory_stat.stat.exists | default(false)"
           - "mds_inventory_stat.stat.isreg | default(false)"
           - "mds_inventory_stat.stat.size | default(0) | int > 0"
+          - "mds_inventory_stat.stat.readable | default(false)"
         fail_msg: |
-          The MDS inventory file is missing or empty:
+          The MDS inventory file is missing, empty, or unreadable:
 
           {{ mds_inventory_file }}
 
-          Run the MDS inventory-generation Job Template first.
+          The AWX SSH account must have read access to this file.
         success_msg: >-
-          MDS inventory file is available.
+          MDS inventory file is available and readable.
 
 
     # ============================================================
-    # 13. Read and decode mds_inventory
+    # 14. Read and decode mds_inventory
     # ============================================================
 
     - name: Read CMA inventory
@@ -447,7 +472,7 @@
 
 
     # ============================================================
-    # 14. Resolve embedded CMA name to CMA IP
+    # 15. Resolve embedded CMA name to CMA IP
     #
     # Expected inventory format:
     #
@@ -538,7 +563,65 @@
 
 
     # ============================================================
-    # 15. Create Job ID directory
+    # 16. Validate base-directory permissions
+    #
+    # This playbook does not use sudo. The connected AWX SSH
+    # account must be able to write under filters_base_dir.
+    # ============================================================
+
+    - name: Check Filters base directory
+      ansible.builtin.stat:
+        path: "{{ filters_base_dir }}"
+      register: filters_base_stat
+
+
+    - name: Require Filters base directory
+      ansible.builtin.assert:
+        that:
+          - "filters_base_stat.stat.exists | default(false)"
+          - "filters_base_stat.stat.isdir | default(false)"
+        fail_msg: |
+          The Filters base directory does not exist:
+
+          {{ filters_base_dir }}
+
+          Create the directory before running this playbook.
+        success_msg: >-
+          Filters base directory exists.
+
+
+    - name: Test write access to Filters base directory
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/test
+          - -w
+          - "{{ filters_base_dir }}"
+      register: filters_write_test
+      changed_when: false
+      failed_when: false
+
+
+    - name: Require write access to Filters base directory
+      ansible.builtin.assert:
+        that:
+          - "filters_write_test.rc | int == 0"
+        fail_msg: |
+          The AWX SSH account cannot write to:
+
+          {{ filters_base_dir }}
+
+          The playbook is running without sudo because the SSH account
+          is not in sudoers.
+
+          On the MDS, grant the AWX SSH account access to the CDT
+          project directories before rerunning the job.
+        success_msg: >-
+          AWX SSH account has write access to
+          {{ filters_base_dir }}.
+
+
+    # ============================================================
+    # 17. Create Job ID directory
     #
     # /var/log/CDT_Project/Filters/<job_id>/
     # ============================================================
@@ -551,7 +634,7 @@
 
 
     # ============================================================
-    # 16. Check existing selected_targets.yml
+    # 18. Check existing selected_targets.yml
     # ============================================================
 
     - name: Check selected_targets.yml
@@ -561,7 +644,7 @@
 
 
     # ============================================================
-    # 17. Read existing selected_targets.yml
+    # 19. Read existing selected_targets.yml
     # ============================================================
 
     - name: Read existing selected_targets.yml
@@ -585,7 +668,7 @@
 
 
     # ============================================================
-    # 18. Initialize a new Job ID
+    # 20. Initialize a new Job ID
     # ============================================================
 
     - name: Initialize new Job ID data
@@ -601,7 +684,7 @@
 
 
     # ============================================================
-    # 19. Validate existing selected_targets.yml
+    # 21. Validate existing selected_targets.yml
     # ============================================================
 
     - name: Validate existing YAML data
@@ -635,7 +718,7 @@
 
 
     # ============================================================
-    # 20. Find CMA in the existing Job selection
+    # 22. Find current CMA in existing Job selection
     # ============================================================
 
     - name: Find selected CMA in existing Job
@@ -662,11 +745,11 @@
 
           {{ selected_targets_file }}
 
-          Correct the existing file before continuing.
+          Correct the file before continuing.
 
 
     # ============================================================
-    # 21. Validate stored CMA IP
+    # 23. Validate stored CMA IP
     # ============================================================
 
     - name: Validate existing CMA IP
@@ -686,7 +769,7 @@
 
 
     # ============================================================
-    # 22. Merge targets for an existing CMA
+    # 24. Merge targets for existing CMA
     # ============================================================
 
     - name: Read existing targets for current CMA
@@ -700,7 +783,7 @@
         - matching_cmas | length == 1
 
 
-    - name: Merge new targets into existing CMA
+    - name: Merge selected targets into existing CMA
       ansible.builtin.set_fact:
         merged_cma_targets: >-
           {{
@@ -751,7 +834,7 @@
 
 
     # ============================================================
-    # 23. Add a new CMA to the same Job ID
+    # 25. Add a new CMA to the same Job ID
     # ============================================================
 
     - name: Add newly selected CMA
@@ -774,7 +857,7 @@
 
 
     # ============================================================
-    # 24. Build final selected_targets.yml data
+    # 26. Build final selected_targets.yml structure
     # ============================================================
 
     - name: Build final selected target data
@@ -788,7 +871,7 @@
 
 
     # ============================================================
-    # 25. Back up existing selected_targets.yml
+    # 27. Back up existing selected_targets.yml
     # ============================================================
 
     - name: Back up existing selected_targets.yml
@@ -805,7 +888,7 @@
 
 
     # ============================================================
-    # 26. Write selected_targets.yml
+    # 28. Write selected_targets.yml
     # ============================================================
 
     - name: Write selected_targets.yml
@@ -817,7 +900,7 @@
 
 
     # ============================================================
-    # 27. Read and validate saved file
+    # 29. Read and validate saved file
     # ============================================================
 
     - name: Read saved selected_targets.yml
@@ -850,7 +933,7 @@
 
 
     # ============================================================
-    # 28. Display final summary
+    # 30. Display final summary
     # ============================================================
 
     - name: Display final Job summary
