@@ -1,0 +1,442 @@
+---
+- name: Save selected CDT targets by Job ID
+  hosts: mds
+  gather_facts: false
+  become: true
+
+  vars:
+    filters_base_dir: "/var/log/CDT_Project/Filters"
+
+  tasks:
+
+    # ============================================================
+    # 1. Validate required AWX variables
+    # ============================================================
+
+    - name: Validate Job ID
+      ansible.builtin.assert:
+        that:
+          - job_id is defined
+          - job_id | string | trim | length > 0
+          - job_id is match('^[A-Za-z0-9_-]+$')
+        fail_msg: >-
+          Invalid Job ID.
+          Job ID must not be empty and may contain only
+          letters, numbers, underscore (_) and hyphen (-).
+      run_once: true
+
+    - name: Validate CMA information
+      ansible.builtin.assert:
+        that:
+          - cma_name is defined
+          - cma_name | string | trim | length > 0
+          - cma_ip is defined
+          - cma_ip | string | trim | length > 0
+        fail_msg: >-
+          CMA information is missing.
+          Both cma_name and cma_ip are required.
+      run_once: true
+
+    - name: Validate selected targets
+      ansible.builtin.assert:
+        that:
+          - selected_targets is defined
+          - selected_targets | length > 0
+        fail_msg: >-
+          No Cluster/Gateway target was selected.
+          Please select at least one target.
+      run_once: true
+
+
+    # ============================================================
+    # 2. Normalize variables
+    # ============================================================
+
+    - name: Normalize Job ID and CMA values
+      ansible.builtin.set_fact:
+        normalized_job_id: "{{ job_id | string | trim }}"
+        normalized_cma_name: "{{ cma_name | string | trim }}"
+        normalized_cma_ip: "{{ cma_ip | string | trim }}"
+      run_once: true
+
+    - name: Define Job directory and target file
+      ansible.builtin.set_fact:
+        job_filter_dir: >-
+          {{ filters_base_dir }}/{{ normalized_job_id }}
+        selected_targets_file: >-
+          {{ filters_base_dir }}/{{ normalized_job_id }}/selected_targets.yml
+      run_once: true
+
+
+    # ============================================================
+    # 3. Display information received from AWX
+    # ============================================================
+
+    - name: Display current target selection
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "              CDT TARGET SELECTION"
+          - "============================================================"
+          - "Job ID       : {{ normalized_job_id }}"
+          - "CMA Name     : {{ normalized_cma_name }}"
+          - "CMA IP       : {{ normalized_cma_ip }}"
+          - "Targets      : {{ selected_targets }}"
+          - "Output file  : {{ selected_targets_file }}"
+          - "============================================================"
+      run_once: true
+
+
+    # ============================================================
+    # 4. Create Job ID directory
+    # ============================================================
+
+    - name: Create Job ID filter directory
+      ansible.builtin.file:
+        path: "{{ job_filter_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+
+    # ============================================================
+    # 5. Check whether selected_targets.yml already exists
+    # ============================================================
+
+    - name: Check existing selected_targets.yml
+      ansible.builtin.stat:
+        path: "{{ selected_targets_file }}"
+      register: selected_targets_stat
+
+
+    # ============================================================
+    # 6. Read existing file
+    # ============================================================
+
+    - name: Read existing selected_targets.yml
+      ansible.builtin.slurp:
+        src: "{{ selected_targets_file }}"
+      register: existing_targets_raw
+      when: selected_targets_stat.stat.exists
+
+
+    # ============================================================
+    # 7. Load existing YAML structure
+    # ============================================================
+
+    - name: Parse existing selected_targets.yml
+      ansible.builtin.set_fact:
+        existing_data: >-
+          {{
+            existing_targets_raw.content
+            | b64decode
+            | from_yaml
+          }}
+      when: selected_targets_stat.stat.exists
+
+
+    - name: Initialize data for new Job ID
+      ansible.builtin.set_fact:
+        existing_data:
+          schema_version: 1
+          job_id: "{{ normalized_job_id }}"
+          created_at: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+          updated_at: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+          selected_cmas: []
+      when: not selected_targets_stat.stat.exists
+
+
+    # ============================================================
+    # 8. Validate existing file belongs to this Job ID
+    # ============================================================
+
+    - name: Validate existing Job ID
+      ansible.builtin.assert:
+        that:
+          - existing_data.job_id | string == normalized_job_id
+        fail_msg: >-
+          Existing selected_targets.yml contains Job ID
+          {{ existing_data.job_id | default('UNKNOWN') }},
+          but current Job ID is {{ normalized_job_id }}.
+          Processing stopped for safety.
+
+
+    # ============================================================
+    # 9. Locate existing CMA entry
+    # ============================================================
+
+    - name: Find existing CMA
+      ansible.builtin.set_fact:
+        matching_cmas: >-
+          {{
+            existing_data.selected_cmas
+            | default([])
+            | selectattr('cma_name', 'equalto', normalized_cma_name)
+            | list
+          }}
+
+
+    # ============================================================
+    # 10. Validate CMA IP if CMA already exists
+    # ============================================================
+
+    - name: Validate CMA IP consistency
+      ansible.builtin.assert:
+        that:
+          - matching_cmas[0].cma_ip | string == normalized_cma_ip
+        fail_msg: >-
+          CMA {{ normalized_cma_name }} already exists in this Job ID,
+          but the stored IP is {{ matching_cmas[0].cma_ip }}
+          while the current IP is {{ normalized_cma_ip }}.
+          Processing stopped to prevent inconsistent CMA data.
+      when: matching_cmas | length > 0
+
+
+    # ============================================================
+    # 11. Normalize AWX selected_targets
+    #
+    # Supports:
+    #
+    #   CXL103 (Cluster)
+    #   GW201 (Gateway)
+    #
+    # or:
+    #
+    #   CXL103|Cluster
+    #   GW201|Gateway
+    #
+    # ============================================================
+
+    - name: Initialize normalized target list
+      ansible.builtin.set_fact:
+        normalized_targets: []
+
+
+    - name: Parse target choices using pipe format
+      ansible.builtin.set_fact:
+        normalized_targets: >-
+          {{
+            normalized_targets
+            +
+            [
+              {
+                'name': (item.split('|')[0] | trim),
+                'type': (item.split('|')[1] | trim)
+              }
+            ]
+          }}
+      loop: "{{ selected_targets }}"
+      when:
+        - "'|' in item"
+
+
+    - name: Parse target choices using display format
+      ansible.builtin.set_fact:
+        normalized_targets: >-
+          {{
+            normalized_targets
+            +
+            [
+              {
+                'name':
+                  (
+                    item
+                    | regex_replace('\\s*\\([^)]*\\)\\s*$', '')
+                    | trim
+                  ),
+                'type':
+                  (
+                    item
+                    | regex_search('\\(([^)]*)\\)', '\\1')
+                    | first
+                    | default('Unknown')
+                    | trim
+                  )
+              }
+            ]
+          }}
+      loop: "{{ selected_targets }}"
+      when:
+        - "'|' not in item"
+
+
+    # ============================================================
+    # 12. Remove duplicate targets from current selection
+    # ============================================================
+
+    - name: Remove duplicate targets from current selection
+      ansible.builtin.set_fact:
+        normalized_targets: >-
+          {{
+            normalized_targets
+            | unique(attribute='name')
+            | list
+          }}
+
+
+    # ============================================================
+    # 13. Handle EXISTING CMA
+    # ============================================================
+
+    - name: Prepare existing CMA target list
+      ansible.builtin.set_fact:
+        current_cma_targets: "{{ matching_cmas[0].targets | default([]) }}"
+      when:
+        - matching_cmas | length > 0
+
+
+    - name: Build merged target list for existing CMA
+      ansible.builtin.set_fact:
+        merged_cma_targets: >-
+          {{
+            (current_cma_targets + normalized_targets)
+            | unique(attribute='name')
+            | list
+          }}
+      when:
+        - matching_cmas | length > 0
+
+
+    - name: Build CMA list excluding CMA being updated
+      ansible.builtin.set_fact:
+        cmas_without_current: >-
+          {{
+            existing_data.selected_cmas
+            | rejectattr(
+                'cma_name',
+                'equalto',
+                normalized_cma_name
+              )
+            | list
+          }}
+      when:
+        - matching_cmas | length > 0
+
+
+    - name: Update existing CMA with merged targets
+      ansible.builtin.set_fact:
+        updated_cmas: >-
+          {{
+            cmas_without_current
+            +
+            [
+              {
+                'cma_name': normalized_cma_name,
+                'cma_ip': normalized_cma_ip,
+                'targets': merged_cma_targets
+              }
+            ]
+          }}
+      when:
+        - matching_cmas | length > 0
+
+
+    # ============================================================
+    # 14. Handle NEW CMA
+    # ============================================================
+
+    - name: Add new CMA
+      ansible.builtin.set_fact:
+        updated_cmas: >-
+          {{
+            existing_data.selected_cmas
+            | default([])
+            +
+            [
+              {
+                'cma_name': normalized_cma_name,
+                'cma_ip': normalized_cma_ip,
+                'targets': normalized_targets
+              }
+            ]
+          }}
+      when:
+        - matching_cmas | length == 0
+
+
+    # ============================================================
+    # 15. Build final YAML structure
+    # ============================================================
+
+    - name: Build final selected target data
+      ansible.builtin.set_fact:
+        final_data:
+          schema_version: 1
+          job_id: "{{ normalized_job_id }}"
+          created_at: "{{ existing_data.created_at }}"
+          updated_at: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+          selected_cmas: "{{ updated_cmas }}"
+
+
+    # ============================================================
+    # 16. Backup existing selected_targets.yml
+    # ============================================================
+
+    - name: Backup existing selected_targets.yml
+      ansible.builtin.copy:
+        src: "{{ selected_targets_file }}"
+        dest: >-
+          {{ selected_targets_file }}.bak.{{
+            now(utc=true, fmt='%Y%m%d_%H%M%S')
+          }}
+        remote_src: true
+        mode: "0640"
+      when:
+        - selected_targets_stat.stat.exists
+
+
+    # ============================================================
+    # 17. Write selected_targets.yml
+    # ============================================================
+
+    - name: Write selected_targets.yml
+      ansible.builtin.copy:
+        dest: "{{ selected_targets_file }}"
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          {{ final_data | to_nice_yaml(indent=2, sort_keys=false) }}
+
+
+    # ============================================================
+    # 18. Display final deployment selection
+    # ============================================================
+
+    - name: Display saved CDT target selection
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "         CDT TARGET SELECTION SAVED"
+          - "============================================================"
+          - "Job ID      : {{ normalized_job_id }}"
+          - "File        : {{ selected_targets_file }}"
+          - "CMA Count   : {{ final_data.selected_cmas | length }}"
+          - "============================================================"
+
+
+    - name: Display targets grouped by CMA
+      ansible.builtin.debug:
+        msg:
+          - "CMA Name : {{ item.cma_name }}"
+          - "CMA IP   : {{ item.cma_ip }}"
+          - "Targets  : {{ item.targets | map(attribute='name') | list }}"
+      loop: "{{ final_data.selected_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+
+
+    # ============================================================
+    # 19. Read saved file for final verification
+    # ============================================================
+
+    - name: Read final selected_targets.yml
+      ansible.builtin.slurp:
+        src: "{{ selected_targets_file }}"
+      register: final_saved_file
+
+
+    - name: Show final selected_targets.yml
+      ansible.builtin.debug:
+        msg: "{{ final_saved_file.content | b64decode }}"
