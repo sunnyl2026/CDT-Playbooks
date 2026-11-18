@@ -7,7 +7,7 @@
   vars:
     filters_base_dir: "/var/log/CDT_Project/Filters"
     candidates_dir: "/var/log/CDT_Project/candidates"
-    deployment_plan: "/var/log/CDT_Project/Deployment_Plans/pre-requisite.xml"
+    deployment_plan: "/var/log/CDT_Project/Deployment_Plans/pre-upgrade-check.xml"
 
     # Maximum runtime for each CDT generate operation.
     cdt_async_timeout: 7200
@@ -645,16 +645,147 @@
         label: "{{ item.item.cma_name }}"
 
     # ============================================================
-    # 15. Read generated candidate CSV files
+    # 15. Format generated candidate CSV files for AWX
+    #
+    # The CDT CSV contains a preamble before the real six-column table.
+    # This parser finds the table, removes the preamble, aligns all columns,
+    # and returns stdout_lines so AWX does not display one long escaped
+    # string containing literal "\n" sequences.
     # ============================================================
 
-    - name: Read generated candidate CSV files
-      ansible.builtin.slurp:
-        src: "{{ candidates_dir }}/{{ item.cma_name }}_PR_candidates.csv"
+    - name: Build readable candidate table for each CMA
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+              import csv
+              import sys
+
+              candidate_file = sys.argv[1]
+              cma_name = sys.argv[2]
+
+              expected_header = (
+                  "Gateway Name",
+                  "Cluster Name",
+                  "IP Address",
+                  "Version/JHF Take",
+                  "State",
+                  "Upgrade Order",
+              )
+
+              with open(
+                  candidate_file,
+                  "r",
+                  encoding="utf-8-sig",
+                  errors="replace",
+                  newline="",
+              ) as stream:
+                  csv_rows = [
+                      [column.strip() for column in row]
+                      for row in csv.reader(stream)
+                  ]
+
+              header_index = None
+
+              for index, row in enumerate(csv_rows):
+                  if (
+                      len(row) >= 2
+                      and row[0].casefold() == "gateway name"
+                      and row[1].casefold() == "cluster name"
+                  ):
+                      header_index = index
+                      break
+
+              if header_index is None:
+                  raise SystemExit(
+                      "Could not find the six-column candidate table in "
+                      + candidate_file
+                  )
+
+              candidate_rows = []
+
+              for row in csv_rows[header_index + 1:]:
+                  if len(row) < 6:
+                      continue
+
+                  values = tuple(
+                      column.strip()
+                      for column in row[:6]
+                  )
+
+                  if not any(values):
+                      continue
+
+                  if (
+                      values[0].startswith("*")
+                      or values[0].startswith("=")
+                  ):
+                      continue
+
+                  candidate_rows.append(values)
+
+              if not candidate_rows:
+                  raise SystemExit(
+                      "No candidate rows were found in "
+                      + candidate_file
+                  )
+
+              minimum_widths = (
+                  20,
+                  20,
+                  16,
+                  18,
+                  21,
+                  13,
+              )
+
+              all_rows = [expected_header] + candidate_rows
+
+              widths = [
+                  max(
+                      minimum_widths[column_index],
+                      max(
+                          len(row[column_index])
+                          for row in all_rows
+                      ),
+                  )
+                  for column_index in range(6)
+              ]
+
+              def format_row(row):
+                  return " , ".join(
+                      value.rjust(width)
+                      for value, width in zip(row, widths)
+                  )
+
+              header_line = format_row(expected_header)
+              separator = "=" * len(header_line)
+              border = "*" * len(header_line)
+
+              print(cma_name + ":")
+              print(border)
+              print()
+              print(header_line)
+              print(separator)
+              print()
+
+              for row in candidate_rows:
+                  print(format_row(row))
+
+              print()
+              print(border)
+              print(
+                  "The CDT Deployment Plan Pre-Requisite Check Will Run "
+                  "on The Above Target(s)"
+              )
+          - "{{ candidates_dir }}/{{ item.cma_name }}_PR_candidates.csv"
+          - "{{ item.cma_name }}"
       loop: "{{ selected_targets_data.selected_cmas }}"
       loop_control:
         label: "{{ item.cma_name }}"
-      register: candidate_files
+      register: formatted_candidate_tables
+      changed_when: false
 
     # ============================================================
     # 16. Display candidate summary for approval
@@ -662,32 +793,8 @@
 
     - name: Show Pre-Requisite Check candidate summary
       ansible.builtin.debug:
-        msg: |
-          ################################################################
-          PRE-REQUISITE CHECK CANDIDATE SUMMARY
-          ################################################################
-
-          Job ID:
-          {{ normalized_job_id }}
-
-          CMA Name:
-          {{ item.item.cma_name }}
-
-          CMA IP:
-          {{ item.item.cma_ip }}
-
-          Filter file:
-          {{ job_folder }}/{{ item.item.cma_name }}_PR_filter
-
-          Candidate file:
-          {{ candidates_dir }}/{{ item.item.cma_name }}_PR_candidates.csv
-
-          Candidate file content:
-          ----------------------------------------------------------------
-          {{ item.content | b64decode | trim }}
-          ----------------------------------------------------------------
-          ################################################################
-      loop: "{{ candidate_files.results }}"
+        msg: "{{ item.stdout_lines }}"
+      loop: "{{ formatted_candidate_tables.results }}"
       loop_control:
         label: "{{ item.item.cma_name }}"
 
