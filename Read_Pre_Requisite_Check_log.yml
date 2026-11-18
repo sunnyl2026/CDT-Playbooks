@@ -1,0 +1,380 @@
+---
+- name: Display CDT Pre-Requisite Check Summary
+  hosts: all
+  gather_facts: false
+  become: true
+
+  vars:
+    filters_base_dir: "/var/log/CDT_Project/Filters"
+    candidates_dir: "/var/log/CDT_Project/candidates"
+    gateway_logs_dir: "/var/log/CDT_Project/Gateway_Logs"
+
+  tasks:
+
+    # ============================================================
+    # 1. Validate job_id from AWX Workflow Survey
+    # ============================================================
+
+    - name: Validate job_id
+      ansible.builtin.assert:
+        that:
+          - job_id is defined
+          - job_id | string | trim | length > 0
+        fail_msg: >
+          job_id is not defined.
+          Please provide job_id from the AWX Workflow survey.
+
+    - name: Normalize job_id
+      ansible.builtin.set_fact:
+        deployment_job_id: "{{ job_id | string | trim }}"
+
+    - name: Define selected targets file
+      ansible.builtin.set_fact:
+        selected_targets_file: >-
+          {{ filters_base_dir }}/{{ deployment_job_id }}/selected_targets.yml
+
+
+    # ============================================================
+    # 2. Read selected_targets.yml
+    # ============================================================
+
+    - name: Check selected_targets.yml
+      ansible.builtin.stat:
+        path: "{{ selected_targets_file }}"
+      register: selected_targets_stat
+
+    - name: Stop if selected_targets.yml does not exist
+      ansible.builtin.fail:
+        msg: |
+          selected_targets.yml was not found.
+
+          Job ID:
+          {{ deployment_job_id }}
+
+          Expected file:
+          {{ selected_targets_file }}
+      when: not selected_targets_stat.stat.exists
+
+    - name: Read selected_targets.yml
+      ansible.builtin.slurp:
+        src: "{{ selected_targets_file }}"
+      register: selected_targets_raw
+
+    - name: Parse selected_targets.yml
+      ansible.builtin.set_fact:
+        selected_targets_data: >-
+          {{
+            selected_targets_raw.content
+            | b64decode
+            | from_yaml
+          }}
+
+    - name: Validate selected CMAs exist
+      ansible.builtin.assert:
+        that:
+          - selected_targets_data.selected_cmas is defined
+          - selected_targets_data.selected_cmas | length > 0
+        fail_msg: >
+          No selected_cmas were found in
+          {{ selected_targets_file }}
+
+
+    # ============================================================
+    # 3. Get CMA names
+    #
+    # Example from selected_targets.yml:
+    #
+    # selected_cmas:
+    #   - cma_name: CMA2_SMS1
+    #     cma_ip: 172.20.50.41
+    #     targets:
+    #       - name: CXL103
+    #         type: Cluster
+    #
+    #   - cma_name: CMA3_SMS1
+    #     cma_ip: 172.20.50.42
+    #     targets:
+    #       - name: R8120GW202
+    #         type: Gateway
+    # ============================================================
+
+    - name: Build CMA list
+      ansible.builtin.set_fact:
+        selected_cma_names: >-
+          {{
+            selected_targets_data.selected_cmas
+            | map(attribute='cma_name')
+            | list
+          }}
+
+    - name: Show selected CMAs
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          CDT PRE-REQUISITE CHECK RESULT
+          ============================================================
+          Job ID        : {{ deployment_job_id }}
+          Selected CMAs : {{ selected_cma_names | join(', ') }}
+          ============================================================
+
+
+    # ============================================================
+    # 4. Check candidates CSV for every CMA
+    #
+    # Expected:
+    #
+    # /var/log/CDT_Project/candidates/CMA2_SMS1_PR_candidates.csv
+    # /var/log/CDT_Project/candidates/CMA3_SMS1_PR_candidates.csv
+    # ============================================================
+
+    - name: Check candidate CSV files
+      ansible.builtin.stat:
+        path: "{{ candidates_dir }}/{{ item }}_PR_candidates.csv"
+      loop: "{{ selected_cma_names }}"
+      register: candidate_file_stats
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Stop if a CMA candidate CSV does not exist
+      ansible.builtin.fail:
+        msg: |
+          Candidate CSV was not found.
+
+          CMA:
+          {{ item.item }}
+
+          Expected file:
+          {{ candidates_dir }}/{{ item.item }}_PR_candidates.csv
+      loop: "{{ candidate_file_stats.results }}"
+      when: not item.stat.exists
+      loop_control:
+        label: "{{ item.item }}"
+
+
+    # ============================================================
+    # 5. Extract gateway names from all CMA candidate files
+    #
+    # Candidate line example:
+    #
+    # GW101 , CXL103 , 172.20.50.101 , R81.20/170 , active , 1
+    # GW102 , CXL103 , 172.20.50.102 , R81.20/170 , standby , 1
+    #
+    # We intentionally only select lines beginning with a
+    # non-space gateway value followed by a comma.
+    #
+    # Header/separator/comment lines are ignored.
+    # ============================================================
+
+    - name: Extract gateway names from candidate CSV
+      ansible.builtin.shell: |
+        awk -F',' '
+          /^[[:space:]]*[*=#-]/ { next }
+
+          {
+              gateway=$1
+
+              gsub(/^[[:space:]]+/, "", gateway)
+              gsub(/[[:space:]]+$/, "", gateway)
+
+              if (gateway == "")
+                  next
+
+              if (gateway == "Gateway Name")
+                  next
+
+              print gateway
+          }
+        ' "{{ candidates_dir }}/{{ item }}_PR_candidates.csv"
+      args:
+        executable: /bin/bash
+      loop: "{{ selected_cma_names }}"
+      register: gateway_extract_results
+      changed_when: false
+      loop_control:
+        label: "{{ item }}"
+
+
+    # ============================================================
+    # 6. Build CMA -> Gateway mapping
+    # ============================================================
+
+    - name: Initialize CMA gateway map
+      ansible.builtin.set_fact:
+        cma_gateway_map: []
+
+    - name: Build CMA gateway map
+      ansible.builtin.set_fact:
+        cma_gateway_map: >-
+          {{
+            cma_gateway_map
+            +
+            [
+              {
+                'cma_name': item.item,
+                'gateways':
+                  (
+                    item.stdout_lines
+                    | map('trim')
+                    | reject('equalto', '')
+                    | unique
+                    | list
+                  )
+              }
+            ]
+          }}
+      loop: "{{ gateway_extract_results.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+
+    # ============================================================
+    # 7. Flatten gateway list
+    # ============================================================
+
+    - name: Initialize gateway list
+      ansible.builtin.set_fact:
+        gateway_names: []
+
+    - name: Add gateways to global gateway list
+      ansible.builtin.set_fact:
+        gateway_names: >-
+          {{
+            (
+              gateway_names
+              +
+              item.gateways
+            )
+            | unique
+            | list
+          }}
+      loop: "{{ cma_gateway_map }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+
+    - name: Validate gateways were found
+      ansible.builtin.assert:
+        that:
+          - gateway_names | length > 0
+        fail_msg: >
+          No gateway names were found in the candidate CSV files.
+
+
+    # ============================================================
+    # 8. Show discovered gateways
+    # ============================================================
+
+    - name: Show gateways found from candidate CSV
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          GATEWAYS FOUND FROM CDT CANDIDATE FILES
+          ============================================================
+          {% for cma in cma_gateway_map %}
+          CMA       : {{ cma.cma_name }}
+          Gateways  : {{ cma.gateways | join(', ') }}
+
+          {% endfor %}
+          ============================================================
+
+
+    # ============================================================
+    # 9. Check gateway log files
+    #
+    # Expected:
+    #
+    # /var/log/CDT_Project/Gateway_Logs/
+    #     GW101_pre_requisite_check.log
+    #     GW102_pre_requisite_check.log
+    # ============================================================
+
+    - name: Check gateway pre-requisite log files
+      ansible.builtin.stat:
+        path: "{{ gateway_logs_dir }}/{{ item }}_pre_requisite_check.log"
+      loop: "{{ gateway_names }}"
+      register: gateway_log_stats
+      loop_control:
+        label: "{{ item }}"
+
+
+    # ============================================================
+    # 10. Report missing logs
+    # ============================================================
+
+    - name: Show warning for missing gateway logs
+      ansible.builtin.debug:
+        msg: |
+          WARNING:
+          Pre-requisite check log does not exist for gateway {{ item.item }}.
+
+          Expected:
+          {{ gateway_logs_dir }}/{{ item.item }}_pre_requisite_check.log
+      loop: "{{ gateway_log_stats.results }}"
+      when: not item.stat.exists
+      loop_control:
+        label: "{{ item.item }}"
+
+
+    # ============================================================
+    # 11. Read only PRE-REQUISITE CHECK SUMMARY
+    #
+    # Extract from:
+    #
+    # PRE-REQUISITE CHECK SUMMARY
+    #
+    # until:
+    #
+    # OVERALL STATUS : PASS
+    #
+    # The extraction stops after the OVERALL STATUS line.
+    # ============================================================
+
+    - name: Extract PRE-REQUISITE CHECK SUMMARY from gateway logs
+      ansible.builtin.shell: |
+        awk '
+          /PRE-REQUISITE CHECK SUMMARY/ {
+              found=1
+
+              # Include separator immediately before title
+              if (previous ~ /^=+$/)
+                  print previous
+
+              print
+              next
+          }
+
+          found {
+              print
+
+              if ($0 ~ /^[[:space:]]*OVERALL STATUS[[:space:]]*:/)
+                  exit
+          }
+
+          {
+              previous=$0
+          }
+        ' "{{ gateway_logs_dir }}/{{ item.item }}_pre_requisite_check.log"
+      args:
+        executable: /bin/bash
+      loop: "{{ gateway_log_stats.results }}"
+      when: item.stat.exists
+      register: prereq_summary_results
+      changed_when: false
+      loop_control:
+        label: "{{ item.item }}"
+
+
+    # ============================================================
+    # 12. Display only PRE-REQUISITE CHECK SUMMARY in AWX
+    # ============================================================
+
+    - name: Display PRE-REQUISITE CHECK SUMMARY
+      ansible.builtin.debug:
+        msg: |
+          {{ item.stdout }}
+      loop: "{{ prereq_summary_results.results | default([]) }}"
+      when:
+        - item is not skipped | default(false)
+        - item.stdout is defined
+        - item.stdout | trim | length > 0
+      loop_control:
+        label: "{{ item.item.item | default('Gateway') }}"
