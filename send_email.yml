@@ -1,5 +1,6 @@
-- name: Send Gateway prerequisite log by email
-  hosts: localhost
+---
+- name: Send CDT prerequisite log directly from MDS
+  hosts: mds
   gather_facts: false
 
   vars:
@@ -11,29 +12,27 @@
     mail_from: "cdtadmin@hkps.cp"
     mail_to: "sunny@hkps.cp"
 
-    local_log_file: "/tmp/{{ gateway_name }}_pre_requisite_check.log"
+    log_file: "/var/log/CDT_Project/Gateway_Logs/{{ gateway_name }}_pre_requisite_check.log"
 
   tasks:
 
-    - name: Check downloaded log exists
+    - name: Check prerequisite log exists
       ansible.builtin.stat:
-        path: "{{ local_log_file }}"
+        path: "{{ log_file }}"
       register: log_status
 
-    - name: Fail if downloaded log does not exist
+    - name: Fail if log does not exist
       ansible.builtin.fail:
-        msg: "Log file does not exist: {{ local_log_file }}"
+        msg: "Log file does not exist: {{ log_file }}"
       when: not log_status.stat.exists
 
-    - name: Send prerequisite log by email
+    - name: Send prerequisite log directly from MDS
       community.general.mail:
         host: "{{ smtp_server }}"
         port: "{{ smtp_port }}"
-
         from: "{{ mail_from }}"
         to:
           - "{{ mail_to }}"
-
         subject: "{{ gateway_name }} - Pre-Requisite Check Result"
 
         body: |
@@ -41,14 +40,13 @@
 
           The CDT pre-requisite check for {{ gateway_name }} has completed.
 
-          Please find the complete prerequisite check log attached.
+          Please find the prerequisite check log attached.
 
           Target: {{ gateway_name }}
-          Log: {{ gateway_name }}_pre_requisite_check.log
+          Log file: {{ gateway_name }}_pre_requisite_check.log
 
           Regards,
           CDT Automation
 
         attach:
-          - "{{ local_log_file }}"
-
+          - "{{ log_file }}"
