@@ -7,7 +7,7 @@
   vars:
     filters_base_dir: "/var/log/CDT_Project/Filters"
     candidates_dir: "/var/log/CDT_Project/candidates"
-    deployment_plan: "/var/log/CDT_Project/Deployment_Plans/pre-upgrade-check.xml"
+    deployment_plan: "/var/log/CDT_Project/Deployment_Plans/pre-requisite.xml"
 
     # Maximum runtime for each CDT generate operation.
     cdt_async_timeout: 7200
