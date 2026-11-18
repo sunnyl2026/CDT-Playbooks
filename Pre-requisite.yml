@@ -33,12 +33,13 @@
         selected_targets_file: >-
           {{ filters_base_dir }}/{{ job_id | string | trim }}/selected_targets.yml
 
-    - name: Define per-run result directory
+    - name: Define per-run result directories
       ansible.builtin.set_fact:
         approved_results_dir: "{{ job_folder }}/approved_cdt_results"
+        execution_results_dir: "{{ job_folder }}/approved_cdt_execution_results"
 
     # ============================================================
-    # Read selected_targets.yml again
+    # Read selected_targets.yml
     # ============================================================
 
     - name: Check selected_targets.yml
@@ -94,6 +95,9 @@
           - item.cma_name | string | trim is match('^[A-Za-z0-9_.-]+$')
           - item.cma_ip is defined
           - item.cma_ip | string | trim | length > 0
+          - item.targets is defined
+          - item.targets is sequence
+          - item.targets | length > 0
         fail_msg: |
           Invalid CMA entry:
 
@@ -101,6 +105,23 @@
       loop: "{{ selected_targets_data.selected_cmas }}"
       loop_control:
         label: "{{ item.cma_name | default('UNKNOWN CMA') }}"
+
+    - name: Validate every selected target
+      ansible.builtin.assert:
+        that:
+          - item.1 is mapping
+          - item.1.name is defined
+          - item.1.name | string | trim | length > 0
+          - item.1.type is defined
+          - item.1.type | string | trim | length > 0
+        fail_msg: |
+          Invalid target entry for CMA {{ item.0.cma_name }}:
+
+          {{ item.1 | to_nice_yaml }}
+      loop: "{{ selected_targets_data.selected_cmas | subelements('targets') }}"
+      loop_control:
+        label: >-
+          {{ item.0.cma_name }} / {{ item.1.name | default('UNKNOWN TARGET') }}
 
     # ============================================================
     # Check required paths
@@ -137,7 +158,7 @@
         mode: "0700"
 
     # ============================================================
-    # Show approved execution scope
+    # Show approved candidate generation scope
     # ============================================================
 
     - name: Show approved CDT generation scope
@@ -163,9 +184,9 @@
         label: "{{ item.cma_name }}"
 
     # ============================================================
-    # Start CDT jobs in parallel
+    # Start CDT candidate generation in parallel
     #
-    # The login shell writes rc/stdout/stderr to explicit files.
+    # Each login shell writes authoritative rc/stdout/stderr files.
     # This avoids depending on async_status to return those fields.
     # ============================================================
 
@@ -231,7 +252,7 @@
       changed_when: true
 
     # ============================================================
-    # Wait for every parallel job
+    # Wait for every candidate generation job
     # ============================================================
 
     - name: Wait for approved CDT generation to complete
@@ -265,7 +286,7 @@
         label: "{{ item.async_job.item.cma_name }}"
 
     # ============================================================
-    # Read the authoritative per-CMA command results
+    # Read authoritative candidate generation results
     # ============================================================
 
     - name: Check approved CDT return-code files
@@ -389,7 +410,7 @@
         label: "{{ selected_targets_data.selected_cmas[item].cma_name }}"
 
     # ============================================================
-    # Read and validate updated candidate files
+    # Validate and read updated candidate files
     # ============================================================
 
     - name: Check updated candidate CSV files
@@ -427,7 +448,7 @@
       register: updated_candidate_files
 
     # ============================================================
-    # Final updated summary
+    # Show readable per-CMA candidate summaries
     # ============================================================
 
     - name: Show updated candidate summary
@@ -449,11 +470,11 @@
       loop_control:
         label: "{{ item.item.cma_name }}"
 
-    - name: Show final completion summary
+    - name: Show approved generation completion summary
       ansible.builtin.debug:
         msg: |
           ============================================================
-          APPROVED CDT GENERATION COMPLETED
+          APPROVED CDT CANDIDATE GENERATION COMPLETED
           ============================================================
 
           Job ID:
@@ -462,11 +483,345 @@
           CMA count:
           {{ selected_targets_data.selected_cmas | length }}
 
-          Processed CMAs:
+          Generated candidates:
           {% for cma in selected_targets_data.selected_cmas %}
           - {{ cma.cma_name }}
             Server: {{ cma.cma_ip }}
             Candidates: {{ candidates_dir }}/{{ cma.cma_name }}_PR_candidates.csv
           {% endfor %}
 
+          Candidate files have been validated and will now be executed.
+          ============================================================
+
+    # ============================================================
+    # Prepare deployment plan execution
+    # ============================================================
+
+    - name: Remove stale deployment execution result directory
+      ansible.builtin.file:
+        path: "{{ execution_results_dir }}"
+        state: absent
+
+    - name: Create clean deployment execution result directory
+      ansible.builtin.file:
+        path: "{{ execution_results_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Show approved deployment execution scope
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          APPROVED PREREQUISITE DEPLOYMENT PLAN EXECUTION
+
+          Job ID:
+          {{ normalized_job_id }}
+
+          CMA:
+          {{ item.cma_name }}
+
+          CMA IP:
+          {{ item.cma_ip }}
+
+          Session:
+          {{ item.cma_name }}_session
+
+          Candidate input:
+          {{ candidates_dir }}/{{ item.cma_name }}_PR_candidates.csv
+
+          Deployment plan:
+          {{ deployment_plan }}
+
+          Selected targets included in the candidate file:
+          {% for target in item.targets %}
+          - {{ target.name }} ({{ target.type }})
+          {% endfor %}
+          ============================================================
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+
+    # ============================================================
+    # Execute deployment plan in parallel
+    #
+    # Each login shell writes authoritative rc/stdout/stderr files.
+    # Candidate files are revalidated inside the execution shell.
+    # ============================================================
+
+    - name: Start approved deployment plan execution for all CMAs in parallel
+      ansible.builtin.shell:
+        cmd: |
+          /bin/bash --login <<'CDT_EXECUTE_LOGIN_SHELL'
+          result_base={{ (execution_results_dir ~ '/' ~ item.cma_name) | quote }}
+          stdout_file="${result_base}.stdout"
+          stderr_file="${result_base}.stderr"
+          rc_file="${result_base}.rc"
+          rc_tmp="${rc_file}.tmp.$$"
+
+          exec >"${stdout_file}" 2>"${stderr_file}"
+
+          write_result_on_exit() {
+              rc=$?
+              trap - EXIT
+              printf '%s\n' "${rc}" >"${rc_tmp}"
+              mv -f "${rc_tmp}" "${rc_file}"
+              exit "${rc}"
+          }
+          trap write_result_on_exit EXIT
+
+          set -o pipefail
+          shopt -s expand_aliases
+
+          candidate_file={{ (candidates_dir ~ '/' ~ item.cma_name ~ '_PR_candidates.csv') | quote }}
+
+          echo "CMA={{ item.cma_name }}"
+          echo "CMA_IP={{ item.cma_ip }}"
+          echo "SESSION={{ item.cma_name }}_session"
+          echo "CANDIDATES=${candidate_file}"
+          echo "DEPLOYMENT_PLAN={{ deployment_plan }}"
+
+          if [[ ! -s "${candidate_file}" ]]; then
+              echo "ERROR: candidate file is missing or empty: ${candidate_file}" >&2
+              exit 1
+          fi
+
+          if ! type mdsenv >/dev/null 2>&1; then
+              echo "ERROR: mdsenv is not available in the login shell" >&2
+              exit 1
+          fi
+
+          if ! mdsenv {{ item.cma_name | quote }}; then
+              echo "ERROR: mdsenv failed for {{ item.cma_name }}" >&2
+              exit 1
+          fi
+
+          if [[ -z "${CDTDIR:-}" ]]; then
+              echo "ERROR: CDTDIR is not defined after mdsenv {{ item.cma_name }}" >&2
+              exit 1
+          fi
+
+          echo "CDTDIR=${CDTDIR}"
+
+          "${CDTDIR}/CentralDeploymentTool" -execute \
+            -session={{ (item.cma_name ~ '_session') | quote }} \
+            -candidates={{ (candidates_dir ~ '/' ~ item.cma_name ~ '_PR_candidates.csv') | quote }} \
+            -deploymentplan={{ deployment_plan | quote }} \
+            -server={{ item.cma_ip | quote }}
+          CDT_EXECUTE_LOGIN_SHELL
+      args:
+        executable: /bin/bash
+      async: 7200
+      poll: 0
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+      register: deployment_execution_async_jobs
+      changed_when: true
+
+    # ============================================================
+    # Wait for every parallel deployment execution
+    # ============================================================
+
+    - name: Wait for approved deployment plan execution to complete
+      ansible.builtin.async_status:
+        jid: "{{ execution_job.ansible_job_id }}"
+        mode: status
+      loop: "{{ deployment_execution_async_jobs.results }}"
+      loop_control:
+        loop_var: execution_job
+        label: "{{ execution_job.item.cma_name }}"
+      register: deployment_execution_poll
+      until: (deployment_execution_poll.finished | default(false)) | bool
+      retries: 240
+      delay: 30
+      failed_when: false
+
+    - name: Stop if a deployment execution job did not finish
+      ansible.builtin.assert:
+        that:
+          - (item.finished | default(false)) | bool
+        fail_msg: |
+          Deployment plan execution did not finish within 7200 seconds.
+
+          CMA:
+          {{ item.execution_job.item.cma_name }}
+
+          CMA IP:
+          {{ item.execution_job.item.cma_ip }}
+      loop: "{{ deployment_execution_poll.results }}"
+      loop_control:
+        label: "{{ item.execution_job.item.cma_name }}"
+
+    # ============================================================
+    # Read authoritative deployment execution results
+    # ============================================================
+
+    - name: Check deployment execution return-code files
+      ansible.builtin.stat:
+        path: "{{ execution_results_dir }}/{{ item.cma_name }}.rc"
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+      register: deployment_execution_rc_stats
+
+    - name: Check deployment execution stdout files
+      ansible.builtin.stat:
+        path: "{{ execution_results_dir }}/{{ item.cma_name }}.stdout"
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+      register: deployment_execution_stdout_stats
+
+    - name: Check deployment execution stderr files
+      ansible.builtin.stat:
+        path: "{{ execution_results_dir }}/{{ item.cma_name }}.stderr"
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+      register: deployment_execution_stderr_stats
+
+    - name: Stop if a deployment execution result file is missing
+      ansible.builtin.assert:
+        that:
+          - (deployment_execution_rc_stats.results[item].stat.exists | default(false)) | bool
+          - (deployment_execution_stdout_stats.results[item].stat.exists | default(false)) | bool
+          - (deployment_execution_stderr_stats.results[item].stat.exists | default(false)) | bool
+        fail_msg: |
+          One or more deployment execution result files are missing.
+
+          CMA:
+          {{ selected_targets_data.selected_cmas[item].cma_name }}
+
+          Expected files:
+          {{ execution_results_dir }}/{{ selected_targets_data.selected_cmas[item].cma_name }}.rc
+          {{ execution_results_dir }}/{{ selected_targets_data.selected_cmas[item].cma_name }}.stdout
+          {{ execution_results_dir }}/{{ selected_targets_data.selected_cmas[item].cma_name }}.stderr
+      loop: "{{ range(0, selected_targets_data.selected_cmas | length) | list }}"
+      loop_control:
+        label: "{{ selected_targets_data.selected_cmas[item].cma_name }}"
+
+    - name: Read deployment execution return codes
+      ansible.builtin.slurp:
+        src: "{{ execution_results_dir }}/{{ item.cma_name }}.rc"
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+      register: deployment_execution_rc_files
+
+    - name: Read deployment execution standard output
+      ansible.builtin.slurp:
+        src: "{{ execution_results_dir }}/{{ item.cma_name }}.stdout"
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+      register: deployment_execution_stdout_files
+
+    - name: Read deployment execution standard error
+      ansible.builtin.slurp:
+        src: "{{ execution_results_dir }}/{{ item.cma_name }}.stderr"
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+      register: deployment_execution_stderr_files
+
+    - name: Show approved deployment execution results
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          CMA: {{ selected_targets_data.selected_cmas[item].cma_name }}
+          CMA IP: {{ selected_targets_data.selected_cmas[item].cma_ip }}
+          Session: {{ selected_targets_data.selected_cmas[item].cma_name }}_session
+          Candidate file: {{ candidates_dir }}/{{ selected_targets_data.selected_cmas[item].cma_name }}_PR_candidates.csv
+          Deployment plan: {{ deployment_plan }}
+          Return code: {{ deployment_execution_rc_files.results[item].content | b64decode | trim }}
+
+          Standard output:
+          {{ deployment_execution_stdout_files.results[item].content | b64decode | trim }}
+
+          Standard error:
+          {{ deployment_execution_stderr_files.results[item].content | b64decode | trim }}
+          ============================================================
+      loop: "{{ range(0, selected_targets_data.selected_cmas | length) | list }}"
+      loop_control:
+        label: "{{ selected_targets_data.selected_cmas[item].cma_name }}"
+
+    - name: Stop if any approved deployment execution failed
+      ansible.builtin.assert:
+        that:
+          - deployment_execution_rc_files.results[item].content
+            | b64decode
+            | trim
+            is match('^[0-9]+$')
+          - (
+              deployment_execution_rc_files.results[item].content
+              | b64decode
+              | trim
+              | int
+            ) == 0
+        fail_msg: |
+          Approved deployment plan execution failed.
+
+          CMA:
+          {{ selected_targets_data.selected_cmas[item].cma_name }}
+
+          CMA IP:
+          {{ selected_targets_data.selected_cmas[item].cma_ip }}
+
+          Session:
+          {{ selected_targets_data.selected_cmas[item].cma_name }}_session
+
+          Candidate file:
+          {{ candidates_dir }}/{{ selected_targets_data.selected_cmas[item].cma_name }}_PR_candidates.csv
+
+          Deployment plan:
+          {{ deployment_plan }}
+
+          Return code:
+          {{ deployment_execution_rc_files.results[item].content | b64decode | trim }}
+
+          Standard output:
+          {{ deployment_execution_stdout_files.results[item].content | b64decode | trim }}
+
+          Standard error:
+          {{ deployment_execution_stderr_files.results[item].content | b64decode | trim }}
+      loop: "{{ range(0, selected_targets_data.selected_cmas | length) | list }}"
+      loop_control:
+        label: "{{ selected_targets_data.selected_cmas[item].cma_name }}"
+
+    # ============================================================
+    # Final execution summary
+    # ============================================================
+
+    - name: Show final approved execution summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          APPROVED CDT PREREQUISITE EXECUTION COMPLETED
+          ============================================================
+
+          Job ID:
+          {{ normalized_job_id }}
+
+          CMA count:
+          {{ selected_targets_data.selected_cmas | length }}
+
+          Deployment plan:
+          {{ deployment_plan }}
+
+          Execution results:
+          {% for cma in selected_targets_data.selected_cmas %}
+          {% set cma_index = loop.index0 %}
+          - CMA: {{ cma.cma_name }}
+            Server: {{ cma.cma_ip }}
+            Session: {{ cma.cma_name }}_session
+            Candidates: {{ candidates_dir }}/{{ cma.cma_name }}_PR_candidates.csv
+            Targets:
+            {% for target in cma.targets %}
+              - {{ target.name }} ({{ target.type }})
+            {% endfor %}
+            Return code: {{ deployment_execution_rc_files.results[cma_index].content | b64decode | trim }}
+            Status: SUCCESS
+          {% endfor %}
+
+          All approved CMA deployment plan executions completed successfully.
           ============================================================
