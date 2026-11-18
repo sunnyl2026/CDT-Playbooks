@@ -10,7 +10,6 @@
     deployment_plan: "/var/log/CDT_Project/Deployment_Plans/pre-requisite.xml"
 
   tasks:
-
     # ============================================================
     # Validate survey input
     # ============================================================
@@ -33,6 +32,10 @@
         job_folder: "{{ filters_base_dir }}/{{ job_id | string | trim }}"
         selected_targets_file: >-
           {{ filters_base_dir }}/{{ job_id | string | trim }}/selected_targets.yml
+
+    - name: Define per-run result directory
+      ansible.builtin.set_fact:
+        approved_results_dir: "{{ job_folder }}/approved_cdt_results"
 
     # ============================================================
     # Read selected_targets.yml again
@@ -100,7 +103,7 @@
         label: "{{ item.cma_name | default('UNKNOWN CMA') }}"
 
     # ============================================================
-    # Check deployment plan
+    # Check required paths
     # ============================================================
 
     - name: Check CDT deployment plan
@@ -121,6 +124,17 @@
         path: "{{ candidates_dir }}"
         state: directory
         mode: "0755"
+
+    - name: Remove stale approved CDT result directory
+      ansible.builtin.file:
+        path: "{{ approved_results_dir }}"
+        state: absent
+
+    - name: Create clean approved CDT result directory
+      ansible.builtin.file:
+        path: "{{ approved_results_dir }}"
+        state: directory
+        mode: "0700"
 
     # ============================================================
     # Show approved execution scope
@@ -149,36 +163,65 @@
         label: "{{ item.cma_name }}"
 
     # ============================================================
-    # Start unfiltered CDT jobs in parallel
+    # Start CDT jobs in parallel
+    #
+    # The login shell writes rc/stdout/stderr to explicit files.
+    # This avoids depending on async_status to return those fields.
     # ============================================================
 
     - name: Start approved CDT generation for all CMAs in parallel
       ansible.builtin.shell:
-        executable: /bin/bash
         cmd: |
+          /bin/bash --login <<'CDT_LOGIN_SHELL'
+          result_base={{ (approved_results_dir ~ '/' ~ item.cma_name) | quote }}
+          stdout_file="${result_base}.stdout"
+          stderr_file="${result_base}.stderr"
+          rc_file="${result_base}.rc"
+          rc_tmp="${rc_file}.tmp.$$"
+
+          exec >"${stdout_file}" 2>"${stderr_file}"
+
+          write_result_on_exit() {
+              rc=$?
+              trap - EXIT
+              printf '%s\n' "${rc}" >"${rc_tmp}"
+              mv -f "${rc_tmp}" "${rc_file}"
+              exit "${rc}"
+          }
+          trap write_result_on_exit EXIT
+
           set -o pipefail
-
-          mdsenv {{ item.cma_name | quote }}
-
-          if [[ -z "${CDTDIR:-}" ]]; then
-              echo "ERROR: CDTDIR is not defined after mdsenv {{ item.cma_name }}"
-              exit 1
-          fi
+          shopt -s expand_aliases
 
           echo "CMA={{ item.cma_name }}"
           echo "CMA_IP={{ item.cma_ip }}"
-          echo "CDTDIR=${CDTDIR}"
           echo "CANDIDATES={{ candidates_dir }}/{{ item.cma_name }}_PR_candidates.csv"
+
+          if ! type mdsenv >/dev/null 2>&1; then
+              echo "ERROR: mdsenv is not available in the login shell" >&2
+              exit 1
+          fi
+
+          if ! mdsenv {{ item.cma_name | quote }}; then
+              echo "ERROR: mdsenv failed for {{ item.cma_name }}" >&2
+              exit 1
+          fi
+
+          if [[ -z "${CDTDIR:-}" ]]; then
+              echo "ERROR: CDTDIR is not defined after mdsenv {{ item.cma_name }}" >&2
+              exit 1
+          fi
+
+          echo "CDTDIR=${CDTDIR}"
 
           "${CDTDIR}/CentralDeploymentTool" -generate \
             -session={{ (item.cma_name ~ '_session') | quote }} \
             -candidates={{ (candidates_dir ~ '/' ~ item.cma_name ~ '_PR_candidates.csv') | quote }} \
             -deploymentplan={{ deployment_plan | quote }} \
             -server={{ item.cma_ip | quote }}
+          CDT_LOGIN_SHELL
       args:
         executable: /bin/bash
-      environment:
-        HOME: "{{ ansible_env.HOME | default('/root') }}"
       async: 7200
       poll: 0
       loop: "{{ selected_targets_data.selected_cmas }}"
@@ -193,62 +236,160 @@
 
     - name: Wait for approved CDT generation to complete
       ansible.builtin.async_status:
-        jid: "{{ item.ansible_job_id }}"
+        jid: "{{ async_job.ansible_job_id }}"
+        mode: status
       loop: "{{ approved_cdt_async_jobs.results }}"
       loop_control:
-        label: "{{ item.item.cma_name }}"
-      register: approved_cdt_results
-      until: approved_cdt_results.finished
+        loop_var: async_job
+        label: "{{ async_job.item.cma_name }}"
+      register: approved_cdt_poll
+      until: (approved_cdt_poll.finished | default(false)) | bool
       retries: 240
       delay: 30
       failed_when: false
+
+    - name: Stop if an asynchronous job did not finish
+      ansible.builtin.assert:
+        that:
+          - (item.finished | default(false)) | bool
+        fail_msg: |
+          Approved CDT generation did not finish within 7200 seconds.
+
+          CMA:
+          {{ item.async_job.item.cma_name }}
+
+          CMA IP:
+          {{ item.async_job.item.cma_ip }}
+      loop: "{{ approved_cdt_poll.results }}"
+      loop_control:
+        label: "{{ item.async_job.item.cma_name }}"
+
+    # ============================================================
+    # Read the authoritative per-CMA command results
+    # ============================================================
+
+    - name: Check approved CDT return-code files
+      ansible.builtin.stat:
+        path: "{{ approved_results_dir }}/{{ item.cma_name }}.rc"
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+      register: approved_cdt_rc_stats
+
+    - name: Check approved CDT stdout files
+      ansible.builtin.stat:
+        path: "{{ approved_results_dir }}/{{ item.cma_name }}.stdout"
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+      register: approved_cdt_stdout_stats
+
+    - name: Check approved CDT stderr files
+      ansible.builtin.stat:
+        path: "{{ approved_results_dir }}/{{ item.cma_name }}.stderr"
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+      register: approved_cdt_stderr_stats
+
+    - name: Stop if an approved CDT result file is missing
+      ansible.builtin.assert:
+        that:
+          - (approved_cdt_rc_stats.results[item].stat.exists | default(false)) | bool
+          - (approved_cdt_stdout_stats.results[item].stat.exists | default(false)) | bool
+          - (approved_cdt_stderr_stats.results[item].stat.exists | default(false)) | bool
+        fail_msg: |
+          One or more approved CDT result files are missing.
+
+          CMA:
+          {{ selected_targets_data.selected_cmas[item].cma_name }}
+
+          Expected files:
+          {{ approved_results_dir }}/{{ selected_targets_data.selected_cmas[item].cma_name }}.rc
+          {{ approved_results_dir }}/{{ selected_targets_data.selected_cmas[item].cma_name }}.stdout
+          {{ approved_results_dir }}/{{ selected_targets_data.selected_cmas[item].cma_name }}.stderr
+      loop: "{{ range(0, selected_targets_data.selected_cmas | length) | list }}"
+      loop_control:
+        label: "{{ selected_targets_data.selected_cmas[item].cma_name }}"
+
+    - name: Read approved CDT return codes
+      ansible.builtin.slurp:
+        src: "{{ approved_results_dir }}/{{ item.cma_name }}.rc"
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+      register: approved_cdt_rc_files
+
+    - name: Read approved CDT standard output
+      ansible.builtin.slurp:
+        src: "{{ approved_results_dir }}/{{ item.cma_name }}.stdout"
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+      register: approved_cdt_stdout_files
+
+    - name: Read approved CDT standard error
+      ansible.builtin.slurp:
+        src: "{{ approved_results_dir }}/{{ item.cma_name }}.stderr"
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+      register: approved_cdt_stderr_files
 
     - name: Show approved CDT command results
       ansible.builtin.debug:
         msg: |
           ============================================================
-          CMA: {{ item.item.item.cma_name }}
-          CMA IP: {{ item.item.item.cma_ip }}
-          Return code: {{ item.rc | default('UNKNOWN') }}
+          CMA: {{ selected_targets_data.selected_cmas[item].cma_name }}
+          CMA IP: {{ selected_targets_data.selected_cmas[item].cma_ip }}
+          Return code: {{ approved_cdt_rc_files.results[item].content | b64decode | trim }}
 
           Standard output:
-          {{ item.stdout | default('') }}
+          {{ approved_cdt_stdout_files.results[item].content | b64decode | trim }}
 
           Standard error:
-          {{ item.stderr | default('') }}
+          {{ approved_cdt_stderr_files.results[item].content | b64decode | trim }}
           ============================================================
-      loop: "{{ approved_cdt_results.results }}"
+      loop: "{{ range(0, selected_targets_data.selected_cmas | length) | list }}"
       loop_control:
-        label: "{{ item.item.item.cma_name }}"
+        label: "{{ selected_targets_data.selected_cmas[item].cma_name }}"
 
     - name: Stop if any approved CDT command failed
       ansible.builtin.assert:
         that:
-          - item.finished | default(false)
-          - item.rc | default(1) == 0
+          - approved_cdt_rc_files.results[item].content
+            | b64decode
+            | trim
+            is match('^[0-9]+$')
+          - (
+              approved_cdt_rc_files.results[item].content
+              | b64decode
+              | trim
+              | int
+            ) == 0
         fail_msg: |
           Approved CDT generation failed.
 
           CMA:
-          {{ item.item.item.cma_name }}
+          {{ selected_targets_data.selected_cmas[item].cma_name }}
 
           CMA IP:
-          {{ item.item.item.cma_ip }}
+          {{ selected_targets_data.selected_cmas[item].cma_ip }}
 
           Return code:
-          {{ item.rc | default('UNKNOWN') }}
+          {{ approved_cdt_rc_files.results[item].content | b64decode | trim }}
 
           Standard output:
-          {{ item.stdout | default('') }}
+          {{ approved_cdt_stdout_files.results[item].content | b64decode | trim }}
 
           Standard error:
-          {{ item.stderr | default('') }}
-      loop: "{{ approved_cdt_results.results }}"
+          {{ approved_cdt_stderr_files.results[item].content | b64decode | trim }}
+      loop: "{{ range(0, selected_targets_data.selected_cmas | length) | list }}"
       loop_control:
-        label: "{{ item.item.item.cma_name }}"
+        label: "{{ selected_targets_data.selected_cmas[item].cma_name }}"
 
     # ============================================================
-    # Read updated candidate files
+    # Read and validate updated candidate files
     # ============================================================
 
     - name: Check updated candidate CSV files
@@ -259,17 +400,20 @@
         label: "{{ item.cma_name }}"
       register: updated_candidate_stats
 
-    - name: Stop if an updated candidate file is missing
-      ansible.builtin.fail:
-        msg: |
-          Updated candidate file was not found.
+    - name: Stop if an updated candidate file is missing or empty
+      ansible.builtin.assert:
+        that:
+          - (item.stat.exists | default(false)) | bool
+          - (item.stat.isreg | default(false)) | bool
+          - (item.stat.size | default(0) | int) > 0
+        fail_msg: |
+          Updated candidate file is missing or empty.
 
           CMA:
           {{ item.item.cma_name }}
 
           Expected file:
           {{ candidates_dir }}/{{ item.item.cma_name }}_PR_candidates.csv
-      when: not item.stat.exists
       loop: "{{ updated_candidate_stats.results }}"
       loop_control:
         label: "{{ item.item.cma_name }}"
