@@ -7,12 +7,12 @@
   vars:
     filters_base_dir: "/var/log/CDT_Project/Filters"
     candidates_dir: "/var/log/CDT_Project/candidates"
-    deployment_plan: "/var/log/CDT_Project/Deployment_Plans/pre-requisite.xml"
+    deployment_plan: "/var/log/CDT_Project/Deployment_Plans/pre-upgrade-check.xml"
 
     # Maximum runtime for each CDT generate operation.
     cdt_async_timeout: 7200
 
-    # Poll every 15 seconds, up to approximately 2 hours.
+    # Poll every 15 seconds for approximately two hours.
     cdt_poll_delay: 15
     cdt_poll_retries: 480
 
@@ -239,7 +239,8 @@
     - name: Verify CMA names are unique
       ansible.builtin.assert:
         that:
-          - selected_cma_names | unique | length == selected_cma_names | length
+          - selected_cma_names | unique | length
+            == selected_cma_names | length
         fail_msg: |
           Duplicate CMA names were found in selected_targets.yml.
 
@@ -362,7 +363,8 @@
 
     - name: Remove previous candidate files
       ansible.builtin.file:
-        path: "{{ candidates_dir }}/{{ item.cma_name }}_PR_candidates.csv"
+        path: >-
+          {{ candidates_dir }}/{{ item.cma_name }}_PR_candidates.csv
         state: absent
       loop: "{{ selected_targets_data.selected_cmas }}"
       loop_control:
@@ -611,7 +613,8 @@
 
     - name: Check generated candidate CSV files
       ansible.builtin.stat:
-        path: "{{ candidates_dir }}/{{ item.cma_name }}_PR_candidates.csv"
+        path: >-
+          {{ candidates_dir }}/{{ item.cma_name }}_PR_candidates.csv
       loop: "{{ selected_targets_data.selected_cmas }}"
       loop_control:
         label: "{{ item.cma_name }}"
@@ -647,10 +650,15 @@
     # ============================================================
     # 15. Format generated candidate CSV files for AWX
     #
-    # The CDT CSV contains a preamble before the real six-column table.
-    # This parser finds the table, removes the preamble, aligns all columns,
-    # and returns stdout_lines so AWX does not display one long escaped
-    # string containing literal "\n" sequences.
+    # The candidate file may contain a CDT text preamble and may
+    # use comma, semicolon, pipe, tab, or aligned whitespace.
+    #
+    # The parser:
+    # - removes BOM and NUL characters;
+    # - ignores case, whitespace, slash and underscore differences;
+    # - accepts alternate field names;
+    # - supports reordered and extra columns;
+    # - extracts only the six required candidate fields.
     # ============================================================
 
     - name: Build readable candidate table for each CMA
@@ -660,12 +668,13 @@
           - -c
           - |
               import csv
+              import re
               import sys
 
               candidate_file = sys.argv[1]
               cma_name = sys.argv[2]
 
-              expected_header = (
+              output_headers = (
                   "Gateway Name",
                   "Cluster Name",
                   "IP Address",
@@ -674,61 +683,273 @@
                   "Upgrade Order",
               )
 
-              with open(
-                  candidate_file,
-                  "r",
-                  encoding="utf-8-sig",
-                  errors="replace",
-                  newline="",
-              ) as stream:
-                  csv_rows = [
-                      [column.strip() for column in row]
-                      for row in csv.reader(stream)
+              required_keys = (
+                  "gatewayname",
+                  "clustername",
+                  "ipaddress",
+                  "versionjhftake",
+                  "state",
+                  "upgradeorder",
+              )
+
+              header_aliases = {
+                  "gatewayname": {
+                      "gatewayname",
+                      "gateway",
+                  },
+                  "clustername": {
+                      "clustername",
+                      "cluster",
+                  },
+                  "ipaddress": {
+                      "ipaddress",
+                      "ipaddr",
+                      "ip",
+                  },
+                  "versionjhftake": {
+                      "versionjhftake",
+                      "versionjhftakelevel",
+                      "versionjhf",
+                      "versiontake",
+                  },
+                  "state": {
+                      "state",
+                      "status",
+                  },
+                  "upgradeorder": {
+                      "upgradeorder",
+                      "upgradeord",
+                      "order",
+                  },
+              }
+
+              def clean_text(value):
+                  return (
+                      value.replace("\ufeff", "")
+                      .replace("\x00", "")
+                      .strip()
+                      .strip('"')
+                      .strip("'")
+                      .strip()
+                  )
+
+              def normalized_header(value):
+                  return re.sub(
+                      r"[^a-z0-9]+",
+                      "",
+                      clean_text(value).casefold(),
+                  )
+
+              def map_header(cells):
+                  normalized_cells = [
+                      normalized_header(cell)
+                      for cell in cells
                   ]
 
-              header_index = None
+                  mapping = {}
 
-              for index, row in enumerate(csv_rows):
-                  if (
-                      len(row) >= 2
-                      and row[0].casefold() == "gateway name"
-                      and row[1].casefold() == "cluster name"
+                  for required_key in required_keys:
+                      aliases = header_aliases[required_key]
+
+                      for index, value in enumerate(normalized_cells):
+                          if value in aliases:
+                              mapping[required_key] = index
+                              break
+
+                  if all(
+                      key in mapping
+                      for key in required_keys
                   ):
-                      header_index = index
+                      return mapping
+
+                  return None
+
+              def parse_delimited_line(line, delimiter):
+                  try:
+                      return next(
+                          csv.reader(
+                              [line],
+                              delimiter=delimiter,
+                              skipinitialspace=True,
+                          )
+                      )
+                  except (csv.Error, StopIteration):
+                      return []
+
+              def parse_whitespace_line(line):
+                  return re.split(
+                      r"\s{2,}",
+                      line.strip(),
+                  )
+
+              with open(candidate_file, "rb") as stream:
+                  raw_content = stream.read()
+
+              text = raw_content.decode(
+                  "utf-8-sig",
+                  errors="replace",
+              )
+
+              text = (
+                  text.replace("\ufeff", "")
+                  .replace("\x00", "")
+                  .replace("\r\n", "\n")
+                  .replace("\r", "\n")
+              )
+
+              # Defensive handling if CDT writes literal escaped
+              # newline sequences instead of physical newlines.
+              if text.count("\n") <= 1 and "\\n" in text:
+                  text = text.replace("\\r\\n", "\n")
+                  text = text.replace("\\n", "\n")
+                  text = text.replace("\\r", "\n")
+
+              lines = text.splitlines()
+
+              parser_kind = None
+              parser_value = None
+              header_index = None
+              header_mapping = None
+
+              delimiter_candidates = (
+                  ",",
+                  ";",
+                  "|",
+                  "\t",
+              )
+
+              # Search the whole file, including the CDT preamble.
+              # A line qualifies as a header only when all six
+              # required fields can be identified.
+              for line_index, line in enumerate(lines):
+                  cleaned_line = clean_text(line)
+
+                  if not cleaned_line:
+                      continue
+
+                  for delimiter in delimiter_candidates:
+                      if delimiter not in line:
+                          continue
+
+                      cells = parse_delimited_line(
+                          line,
+                          delimiter,
+                      )
+
+                      mapping = map_header(cells)
+
+                      if mapping is not None:
+                          parser_kind = "delimiter"
+                          parser_value = delimiter
+                          header_index = line_index
+                          header_mapping = mapping
+                          break
+
+                  if header_mapping is not None:
                       break
 
-              if header_index is None:
-                  raise SystemExit(
-                      "Could not find the six-column candidate table in "
-                      + candidate_file
+                  # Fallback for fixed or aligned output containing
+                  # two or more spaces between columns.
+                  cells = parse_whitespace_line(cleaned_line)
+                  mapping = map_header(cells)
+
+                  if mapping is not None:
+                      parser_kind = "whitespace"
+                      parser_value = None
+                      header_index = line_index
+                      header_mapping = mapping
+                      break
+
+              if header_mapping is None:
+                  diagnostic_lines = [
+                      clean_text(line)
+                      for line in lines
+                      if clean_text(line)
+                  ]
+
+                  diagnostic = " | ".join(
+                      diagnostic_lines[-12:]
                   )
+
+                  raise SystemExit(
+                      "Could not identify the CDT candidate header in "
+                      + candidate_file
+                      + ". Supported separators are comma, semicolon, "
+                      + "pipe, tab, or two-or-more spaces. File tail: "
+                      + diagnostic[:2000]
+                  )
+
+              max_required_index = max(
+                  header_mapping.values()
+              )
 
               candidate_rows = []
 
-              for row in csv_rows[header_index + 1:]:
-                  if len(row) < 6:
+              for line in lines[header_index + 1:]:
+                  cleaned_line = clean_text(line)
+
+                  if not cleaned_line:
+                      continue
+
+                  # Ignore visual separator rows.
+                  if re.fullmatch(
+                      r"[-=*#_+\s]+",
+                      cleaned_line,
+                  ):
+                      continue
+
+                  if parser_kind == "delimiter":
+                      cells = parse_delimited_line(
+                          line,
+                          parser_value,
+                      )
+                  else:
+                      cells = parse_whitespace_line(
+                          cleaned_line
+                      )
+
+                  cells = [
+                      clean_text(cell)
+                      for cell in cells
+                  ]
+
+                  # Extra columns are accepted. Short preamble,
+                  # footer, and informational lines are ignored.
+                  if len(cells) <= max_required_index:
+                      continue
+
+                  # Ignore repeated headers in the data section.
+                  if map_header(cells) is not None:
                       continue
 
                   values = tuple(
-                      column.strip()
-                      for column in row[:6]
+                      cells[header_mapping[key]]
+                      for key in required_keys
                   )
 
-                  if not any(values):
+                  # A valid candidate must have a gateway or cluster
+                  # name and an IP address.
+                  if not (values[0] or values[1]):
                       continue
 
-                  if (
-                      values[0].startswith("*")
-                      or values[0].startswith("=")
-                  ):
+                  if not values[2]:
                       continue
 
                   candidate_rows.append(values)
 
               if not candidate_rows:
+                  delimiter_name = (
+                      repr(parser_value)
+                      if parser_kind == "delimiter"
+                      else "aligned whitespace"
+                  )
+
                   raise SystemExit(
-                      "No candidate rows were found in "
+                      "The CDT candidate header was found in "
                       + candidate_file
+                      + " using "
+                      + delimiter_name
+                      + ", but no candidate rows were found after it."
                   )
 
               minimum_widths = (
@@ -740,7 +961,9 @@
                   13,
               )
 
-              all_rows = [expected_header] + candidate_rows
+              all_rows = [
+                  output_headers
+              ] + candidate_rows
 
               widths = [
                   max(
@@ -759,7 +982,7 @@
                       for value, width in zip(row, widths)
                   )
 
-              header_line = format_row(expected_header)
+              header_line = format_row(output_headers)
               separator = "=" * len(header_line)
               border = "*" * len(header_line)
 
@@ -776,10 +999,11 @@
               print()
               print(border)
               print(
-                  "The CDT Deployment Plan Pre-Requisite Check Will Run "
-                  "on The Above Target(s)"
+                  "The CDT Deployment Plan Pre-Requisite Check "
+                  "Will Run on The Above Target(s)"
               )
-          - "{{ candidates_dir }}/{{ item.cma_name }}_PR_candidates.csv"
+          - >-
+            {{ candidates_dir }}/{{ item.cma_name }}_PR_candidates.csv
           - "{{ item.cma_name }}"
       loop: "{{ selected_targets_data.selected_cmas }}"
       loop_control:
