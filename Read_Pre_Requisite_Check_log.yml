@@ -1,5 +1,5 @@
 ---
-- name: Generate CDT Pre-Requisite Check Summary
+- name: Display CDT Gateway Pre-Requisite Check Summaries
   hosts: all
   gather_facts: false
   become: false
@@ -37,16 +37,10 @@
       ansible.builtin.set_fact:
         deployment_job_id: "{{ job_id | string | trim }}"
 
-    - name: Define job paths
+    - name: Define selected targets file
       ansible.builtin.set_fact:
-        job_directory: >-
-          {{ filters_base_dir }}/{{ deployment_job_id }}
-
         selected_targets_file: >-
           {{ filters_base_dir }}/{{ deployment_job_id }}/selected_targets.yml
-
-        combined_report_file: >-
-          {{ filters_base_dir }}/{{ deployment_job_id }}/pre_requisite_check_summary.log
 
 
     # ============================================================
@@ -73,7 +67,7 @@
     - name: Stop if selected_targets.yml is not a regular file
       ansible.builtin.fail:
         msg: |
-          ERROR: The selected targets path is not a regular file.
+          ERROR: The path exists but is not a regular file.
 
           Path:
           {{ selected_targets_file }}
@@ -89,7 +83,7 @@
           {{ selected_targets_file }}
 
           This playbook does not use sudo.
-          Check file and directory permissions.
+          Check the file and parent-directory permissions.
       when:
         - selected_targets_stat.stat.exists
         - not selected_targets_stat.stat.readable
@@ -206,9 +200,11 @@
 
     - name: Report missing candidate CSV
       ansible.builtin.debug:
-        msg: >-
-          WARNING: Candidate CSV for {{ item.item }} was not found:
-          {{ candidates_dir }}/{{ item.item }}_PR_candidates.csv
+        msg:
+          warning: "Candidate CSV was not found"
+          cma_name: "{{ item.item }}"
+          expected_file: >-
+            {{ candidates_dir }}/{{ item.item }}_PR_candidates.csv
       loop: "{{ candidate_csv_stats.results }}"
       when: not item.stat.exists
       loop_control:
@@ -216,9 +212,11 @@
 
     - name: Report unreadable candidate CSV
       ansible.builtin.debug:
-        msg: >-
-          WARNING: Candidate CSV for {{ item.item }} cannot be read:
-          {{ candidates_dir }}/{{ item.item }}_PR_candidates.csv
+        msg:
+          warning: "Candidate CSV exists but is not readable"
+          cma_name: "{{ item.item }}"
+          candidate_file: >-
+            {{ candidates_dir }}/{{ item.item }}_PR_candidates.csv
       loop: "{{ candidate_csv_stats.results }}"
       when:
         - item.stat.exists
@@ -228,7 +226,7 @@
 
 
     # ============================================================
-    # 6. Read CMA, gateway and cluster mapping
+    # 6. Extract CMA, gateway and cluster association
     #
     # Candidate CSV example:
     #
@@ -236,14 +234,14 @@
     # GW101, CXL103, 172.20.50.101, ...
     # GW102, CXL103, 172.20.50.102, ...
     #
-    # Internal output:
+    # Internal result:
     #
     # CMA2_SMS1|GW101|CXL103
     # CMA2_SMS1|GW102|CXL103
     # CMA3_SMS1|R8120GW202|
     # ============================================================
 
-    - name: Read gateway and cluster mapping
+    - name: Extract gateway and cluster information
       ansible.builtin.shell: |
         awk -F',' -v cma="{{ item.item }}" '
           {
@@ -278,6 +276,10 @@
                   next
               }
 
+              if (cluster !~ /^[A-Za-z0-9_.-]*$/) {
+                  cluster = ""
+              }
+
               print cma "|" gateway "|" cluster
           }
         ' "{{ candidates_dir }}/{{ item.item }}_PR_candidates.csv"
@@ -296,7 +298,7 @@
 
 
     # ============================================================
-    # 7. Build structured target list
+    # 7. Build structured gateway target list
     # ============================================================
 
     - name: Initialize gateway target list
@@ -340,9 +342,10 @@
     - name: Stop if no gateways were discovered
       ansible.builtin.fail:
         msg: |
-          ERROR: No gateways were found in the candidate CSV files.
+          ERROR: No gateway entries were found in the
+          candidate CSV files.
 
-          CMAs:
+          CMAs checked:
           {{ selected_cma_names | join(', ') }}
 
           Candidate directory:
@@ -351,10 +354,10 @@
 
 
     # ============================================================
-    # 8. Check gateway logs
+    # 8. Check gateway prerequisite log files
     # ============================================================
 
-    - name: Check gateway pre-requisite log files
+    - name: Check gateway pre-requisite logs
       ansible.builtin.stat:
         path: >-
           {{ gateway_logs_dir }}/{{ item.gateway_name }}_pre_requisite_check.log
@@ -366,18 +369,16 @@
     - name: Report missing gateway log
       ansible.builtin.debug:
         msg:
-          - "WARNING: Pre-requisite log was not found."
-          - "CMA: {{ item.item.cma_name }}"
-          - >-
-            Cluster:
+          warning: "Pre-requisite check log was not found"
+          cma_name: "{{ item.item.cma_name }}"
+          cluster_name: >-
             {{
               item.item.cluster_name
               if item.item.cluster_name | length > 0
               else 'N/A'
             }}
-          - "Gateway: {{ item.item.gateway_name }}"
-          - >-
-            Expected:
+          gateway_name: "{{ item.item.gateway_name }}"
+          expected_file: >-
             {{ gateway_logs_dir }}/{{ item.item.gateway_name }}_pre_requisite_check.log
       loop: "{{ gateway_log_stats.results }}"
       when: not item.stat.exists
@@ -387,16 +388,17 @@
     - name: Report unreadable gateway log
       ansible.builtin.debug:
         msg:
-          - "WARNING: Pre-requisite log cannot be read."
-          - "CMA: {{ item.item.cma_name }}"
-          - >-
-            Cluster:
+          warning: "Pre-requisite check log is not readable"
+          cma_name: "{{ item.item.cma_name }}"
+          cluster_name: >-
             {{
               item.item.cluster_name
               if item.item.cluster_name | length > 0
               else 'N/A'
             }}
-          - "Gateway: {{ item.item.gateway_name }}"
+          gateway_name: "{{ item.item.gateway_name }}"
+          log_file: >-
+            {{ gateway_logs_dir }}/{{ item.item.gateway_name }}_pre_requisite_check.log
       loop: "{{ gateway_log_stats.results }}"
       when:
         - item.stat.exists
@@ -406,67 +408,31 @@
 
 
     # ============================================================
-    # 9. Initialize combined report
+    # 9. Extract and format PRE-REQUISITE CHECK SUMMARY
+    #
+    # CMA, cluster and gateway are inserted inside the summary.
+    #
+    # Return codes:
+    #
+    # 0 = Complete summary
+    # 2 = Summary heading not found
+    # 3 = OVERALL STATUS not found
     # ============================================================
 
-    - name: Initialize combined prerequisite report
-      ansible.builtin.copy:
-        dest: "{{ combined_report_file }}"
-        mode: "0644"
-        content: |
-          ============================================================
-           CDT PRE-REQUISITE CHECK REPORT
-          ============================================================
-
-          Job ID                    : {{ deployment_job_id }}
-          Generated By              : AWX
-          Selected CMA Count        : {{ selected_cma_names | length }}
-          Discovered Gateway Count  : {{ gateway_targets | length }}
-
-          ============================================================
-
-      register: initialize_report_result
-
-
-    # ============================================================
-    # 10. Generate and append one formatted gateway report
-    #
-    # This task:
-    #
-    # - Reads the original gateway log.
-    # - Extracts only PRE-REQUISITE CHECK SUMMARY.
-    # - Inserts CMA, cluster and gateway details.
-    # - Preserves the original report alignment.
-    # - Appends the complete report to the combined output file.
-    # - Prints one complete summary to task stdout.
-    #
-    # No debug module is used for report body output.
-    # ============================================================
-
-    - name: Generate formatted PRE-REQUISITE CHECK SUMMARY
+    - name: Extract formatted PRE-REQUISITE CHECK SUMMARY
       ansible.builtin.shell: |
-        set -o pipefail
-
-        LOG_FILE="{{ gateway_logs_dir }}/{{ item.item.gateway_name }}_pre_requisite_check.log"
-        REPORT_FILE="{{ combined_report_file }}"
-
-        CMA_NAME="{{ item.item.cma_name }}"
-        CLUSTER_NAME="{{ item.item.cluster_name | default('') }}"
-        GATEWAY_NAME="{{ item.item.gateway_name }}"
-
-        if [ -z "$CLUSTER_NAME" ]; then
-            CLUSTER_NAME="N/A"
-        fi
-
-        TEMP_REPORT=$(mktemp)
-
         awk \
-          -v cma="$CMA_NAME" \
-          -v cluster="$CLUSTER_NAME" \
-          -v gateway="$GATEWAY_NAME" '
+          -v cma="{{ item.item.cma_name }}" \
+          -v cluster="{{ item.item.cluster_name | default('') }}" \
+          -v gateway="{{ item.item.gateway_name }}" '
+
           BEGIN {
               found = 0
               complete = 0
+
+              if (cluster == "") {
+                  cluster = "N/A"
+              }
           }
 
           /PRE-REQUISITE CHECK SUMMARY/ {
@@ -486,6 +452,8 @@
           }
 
           found {
+              # Ignore the original closing equals separator.
+              # A normalized closing separator is printed below.
               if ($0 ~ /^[=]+[[:space:]]*$/) {
                   next
               }
@@ -508,47 +476,8 @@
                   exit 3
               }
           }
-        ' "$LOG_FILE" > "$TEMP_REPORT"
 
-        AWK_RC=$?
-
-        if [ "$AWK_RC" -eq 2 ]; then
-            {
-                echo "============================================================"
-                echo " PRE-REQUISITE CHECK SUMMARY"
-                echo "============================================================"
-                echo
-                printf "%-27s : %s\n" "CMA Name" "$CMA_NAME"
-                printf "%-27s : %s\n" "Cluster Name" "$CLUSTER_NAME"
-                printf "%-27s : %s\n" "Gateway Name" "$GATEWAY_NAME"
-                echo
-                echo "ERROR: PRE-REQUISITE CHECK SUMMARY was not found."
-                echo "============================================================"
-            } > "$TEMP_REPORT"
-        elif [ "$AWK_RC" -eq 3 ]; then
-            {
-                echo "============================================================"
-                echo " PRE-REQUISITE CHECK SUMMARY"
-                echo "============================================================"
-                echo
-                printf "%-27s : %s\n" "CMA Name" "$CMA_NAME"
-                printf "%-27s : %s\n" "Cluster Name" "$CLUSTER_NAME"
-                printf "%-27s : %s\n" "Gateway Name" "$GATEWAY_NAME"
-                echo
-                echo "ERROR: Summary is incomplete."
-                echo "OVERALL STATUS was not found."
-                echo "============================================================"
-            } > "$TEMP_REPORT"
-        fi
-
-        cat "$TEMP_REPORT"
-        echo >> "$REPORT_FILE"
-        cat "$TEMP_REPORT" >> "$REPORT_FILE"
-        echo >> "$REPORT_FILE"
-
-        rm -f "$TEMP_REPORT"
-
-        exit "$AWK_RC"
+        ' "{{ gateway_logs_dir }}/{{ item.item.gateway_name }}_pre_requisite_check.log"
       args:
         executable: /bin/bash
       loop: "{{ gateway_log_stats.results }}"
@@ -556,7 +485,7 @@
         - item.stat.exists
         - item.stat.isreg
         - item.stat.readable
-      register: formatted_report_results
+      register: prereq_summary_results
       changed_when: false
       failed_when: false
       loop_control:
@@ -564,7 +493,97 @@
 
 
     # ============================================================
-    # 11. Count results
+    # 10. Report missing or incomplete summary sections
+    # ============================================================
+
+    - name: Report log without PRE-REQUISITE CHECK SUMMARY
+      ansible.builtin.debug:
+        msg:
+          warning: "PRE-REQUISITE CHECK SUMMARY was not found"
+          cma_name: "{{ item.item.item.cma_name }}"
+          cluster_name: >-
+            {{
+              item.item.item.cluster_name
+              if item.item.item.cluster_name | length > 0
+              else 'N/A'
+            }}
+          gateway_name: "{{ item.item.item.gateway_name }}"
+          log_file: >-
+            {{ gateway_logs_dir }}/{{ item.item.item.gateway_name }}_pre_requisite_check.log
+      loop: "{{ prereq_summary_results.results | default([]) }}"
+      when:
+        - item.skipped is not defined
+        - item.rc is defined
+        - item.rc == 2
+      loop_control:
+        label: "{{ item.item.item.gateway_name | default('Gateway') }}"
+
+    - name: Report incomplete PRE-REQUISITE CHECK SUMMARY
+      ansible.builtin.debug:
+        msg:
+          warning: "PRE-REQUISITE CHECK SUMMARY is incomplete"
+          reason: "OVERALL STATUS was not found"
+          cma_name: "{{ item.item.item.cma_name }}"
+          cluster_name: >-
+            {{
+              item.item.item.cluster_name
+              if item.item.item.cluster_name | length > 0
+              else 'N/A'
+            }}
+          gateway_name: "{{ item.item.item.gateway_name }}"
+          log_file: >-
+            {{ gateway_logs_dir }}/{{ item.item.item.gateway_name }}_pre_requisite_check.log
+      loop: "{{ prereq_summary_results.results | default([]) }}"
+      when:
+        - item.skipped is not defined
+        - item.rc is defined
+        - item.rc == 3
+      loop_control:
+        label: "{{ item.item.item.gateway_name | default('Gateway') }}"
+
+
+    # ============================================================
+    # 11. Display one structured summary per gateway
+    #
+    # This intentionally uses stdout_lines.
+    #
+    # It gives one AWX event per gateway rather than:
+    #
+    # - one huge string containing \n
+    # - one event for every individual line
+    #
+    # ============================================================
+
+    - name: Display PRE-REQUISITE CHECK SUMMARY
+      ansible.builtin.debug:
+        msg:
+          cma_name: "{{ gateway_result.item.item.cma_name }}"
+
+          cluster_name: >-
+            {{
+              gateway_result.item.item.cluster_name
+              if gateway_result.item.item.cluster_name | length > 0
+              else 'N/A'
+            }}
+
+          gateway_name: "{{ gateway_result.item.item.gateway_name }}"
+
+          summary: "{{ gateway_result.stdout_lines }}"
+      loop: >-
+        {{
+          prereq_summary_results.results
+          | default([])
+          | selectattr('rc', 'defined')
+          | selectattr('rc', 'equalto', 0)
+          | list
+        }}
+      loop_control:
+        loop_var: gateway_result
+        label: "{{ gateway_result.item.item.gateway_name }}"
+
+
+    # ============================================================
+    # 12. Calculate result counters
     # ============================================================
 
     - name: Initialize result counters
@@ -578,7 +597,7 @@
     - name: Count complete summaries
       ansible.builtin.set_fact:
         complete_summary_count: "{{ complete_summary_count | int + 1 }}"
-      loop: "{{ formatted_report_results.results | default([]) }}"
+      loop: "{{ prereq_summary_results.results | default([]) }}"
       when:
         - item.skipped is not defined
         - item.rc is defined
@@ -589,7 +608,7 @@
     - name: Count missing summary sections
       ansible.builtin.set_fact:
         missing_summary_count: "{{ missing_summary_count | int + 1 }}"
-      loop: "{{ formatted_report_results.results | default([]) }}"
+      loop: "{{ prereq_summary_results.results | default([]) }}"
       when:
         - item.skipped is not defined
         - item.rc is defined
@@ -597,10 +616,11 @@
       loop_control:
         label: "{{ item.item.item.gateway_name | default('Gateway') }}"
 
-    - name: Count incomplete summaries
+    - name: Count incomplete summary sections
       ansible.builtin.set_fact:
-        incomplete_summary_count: "{{ incomplete_summary_count | int + 1 }}"
-      loop: "{{ formatted_report_results.results | default([]) }}"
+        incomplete_summary_count: >-
+          {{ incomplete_summary_count | int + 1 }}
+      loop: "{{ prereq_summary_results.results | default([]) }}"
       when:
         - item.skipped is not defined
         - item.rc is defined
@@ -628,71 +648,17 @@
 
 
     # ============================================================
-    # 12. Append collection result to combined report
+    # 13. Final result
     # ============================================================
 
-    - name: Append final collection result to report
-      ansible.builtin.blockinfile:
-        path: "{{ combined_report_file }}"
-        marker: ""
-        insertafter: EOF
-        block: |
-          ============================================================
-           PRE-REQUISITE SUMMARY COLLECTION RESULT
-          ============================================================
-
-          Job ID                     : {{ deployment_job_id }}
-          CMAs processed             : {{ selected_cma_names | length }}
-          Gateways discovered        : {{ gateway_targets | length }}
-          Complete summaries         : {{ complete_summary_count }}
-          Missing summary sections   : {{ missing_summary_count }}
-          Incomplete summaries       : {{ incomplete_summary_count }}
-          Missing gateway logs       : {{ missing_log_count }}
-          Unreadable gateway logs    : {{ unreadable_log_count }}
-
-          Combined report:
-          {{ combined_report_file }}
-
-          ============================================================
-
-
-    # ============================================================
-    # 13. Validate combined report
-    # ============================================================
-
-    - name: Check generated combined report
-      ansible.builtin.stat:
-        path: "{{ combined_report_file }}"
-      register: combined_report_stat
-
-    - name: Verify combined report was generated
-      ansible.builtin.assert:
-        that:
-          - combined_report_stat.stat.exists
-          - combined_report_stat.stat.isreg
-          - combined_report_stat.stat.size | int > 0
-        fail_msg: |
-          ERROR: The combined prerequisite report was not generated.
-
-          Expected:
-          {{ combined_report_file }}
-
-
-    # ============================================================
-    # 14. Final AWX result
-    #
-    # This final result is intentionally short.
-    # The exact terminal-style output is stored in the report file.
-    # ============================================================
-
-    - name: Display final collection result
+    - name: Display collection result
       ansible.builtin.debug:
         msg:
-          - "Job ID: {{ deployment_job_id }}"
-          - "CMAs processed: {{ selected_cma_names | length }}"
-          - "Gateways discovered: {{ gateway_targets | length }}"
-          - "Complete summaries: {{ complete_summary_count }}"
-          - "Missing gateway logs: {{ missing_log_count }}"
-          - "Missing summary sections: {{ missing_summary_count }}"
-          - "Incomplete summaries: {{ incomplete_summary_count }}"
-          - "Full formatted report: {{ combined_report_file }}"
+          job_id: "{{ deployment_job_id }}"
+          cmas_processed: "{{ selected_cma_names | length }}"
+          gateways_discovered: "{{ gateway_targets | length }}"
+          complete_summaries: "{{ complete_summary_count }}"
+          missing_gateway_logs: "{{ missing_log_count }}"
+          unreadable_gateway_logs: "{{ unreadable_log_count }}"
+          missing_summary_sections: "{{ missing_summary_count }}"
+          incomplete_summary_sections: "{{ incomplete_summary_count }}"
