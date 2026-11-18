@@ -1,0 +1,54 @@
+- name: Send Gateway prerequisite log by email
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    gateway_name: "GW101"
+
+    smtp_server: "172.20.50.29"
+    smtp_port: 25
+
+    mail_from: "cdtadmin@hkps.cp"
+    mail_to: "sunny@hkps.cp"
+
+    local_log_file: "/tmp/{{ gateway_name }}_pre_requisite_check.log"
+
+  tasks:
+
+    - name: Check downloaded log exists
+      ansible.builtin.stat:
+        path: "{{ local_log_file }}"
+      register: log_status
+
+    - name: Fail if downloaded log does not exist
+      ansible.builtin.fail:
+        msg: "Log file does not exist: {{ local_log_file }}"
+      when: not log_status.stat.exists
+
+    - name: Send prerequisite log by email
+      community.general.mail:
+        host: "{{ smtp_server }}"
+        port: "{{ smtp_port }}"
+
+        from: "{{ mail_from }}"
+        to:
+          - "{{ mail_to }}"
+
+        subject: "{{ gateway_name }} - Pre-Requisite Check Result"
+
+        body: |
+          Hello,
+
+          The CDT pre-requisite check for {{ gateway_name }} has completed.
+
+          Please find the complete prerequisite check log attached.
+
+          Target: {{ gateway_name }}
+          Log: {{ gateway_name }}_pre_requisite_check.log
+
+          Regards,
+          CDT Automation
+
+        attach:
+          - "{{ local_log_file }}"
+
