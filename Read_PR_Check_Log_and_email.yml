@@ -12,7 +12,7 @@
     # Internal mailcow relay. These can be overridden by AWX extra vars.
     smtp_host: "172.20.50.29"
     smtp_port: 25
-    mail_sender: "awx@hkps.cp"
+    mail_sender: "cdtadmin@hkps.cp"
     mail_recipients:
       - "sunny@hkps.cp"
   tasks:
@@ -785,4 +785,5 @@
           This email auto generated after Pre-requisite Check<br>
         attach: "{{ email_log_attachments }}"
       run_once: true
+
 
