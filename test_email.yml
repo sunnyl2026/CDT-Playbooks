@@ -1,0 +1,20 @@
+---
+- name: Test email directly from AWX
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+
+    - name: Send test email from AWX
+      community.general.mail:
+        host: "172.20.50.29"
+        port: 25
+        from: "cdtadmin@hkps.cp"
+        to:
+          - "sunny@hkps.cp"
+        subject: "AWX SMTP Test"
+        body: |
+          This is a test email sent directly from AWX.
+
+          Sender: cdtadmin@hkps.cp
+          Recipient: sunny@hkps.cp
