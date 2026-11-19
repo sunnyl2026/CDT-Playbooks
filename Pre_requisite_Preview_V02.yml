@@ -704,8 +704,10 @@
     # ============================================================
     # 15. Format generated candidate CSV files for AWX
     #
-    # The original, previously working parser is retained unchanged.
-    # It is skipped only when CDT explicitly reports no online target.
+    # The normal, previously working parser path is retained.
+    # It is skipped when CDT explicitly reports no online target.
+    # A CDT-generated preamble and valid candidate header with no
+    # candidate rows is also treated as the no-online-target condition.
     #
     # The candidate file may contain a CDT text preamble and may
     # use comma, semicolon, pipe, tab, or aligned whitespace.
@@ -941,6 +943,7 @@
               )
 
               candidate_rows = []
+              invalid_candidate_rows = []
 
               for line in lines[header_index + 1:]:
                   cleaned_line = clean_text(line)
@@ -972,7 +975,18 @@
 
                   # Extra columns are accepted. Short preamble,
                   # footer, and informational lines are ignored.
+                  #
+                  # A shortened row that still uses the detected
+                  # candidate delimiter is treated as malformed.
                   if len(cells) <= max_required_index:
+                      if (
+                          parser_kind == "delimiter"
+                          and parser_value in line
+                      ) or (
+                          parser_kind == "whitespace"
+                          and len(cells) > 1
+                      ):
+                          invalid_candidate_rows.append(cleaned_line)
                       continue
 
                   # Ignore repeated headers in the data section.
@@ -987,27 +1001,40 @@
                   # A valid candidate must have a gateway or cluster
                   # name and an IP address.
                   if not (values[0] or values[1]):
+                      invalid_candidate_rows.append(cleaned_line)
                       continue
 
                   if not values[2]:
+                      invalid_candidate_rows.append(cleaned_line)
                       continue
 
                   candidate_rows.append(values)
 
               if not candidate_rows:
-                  delimiter_name = (
-                      repr(parser_value)
-                      if parser_kind == "delimiter"
-                      else "aligned whitespace"
-                  )
+                  # Substantive rows were present but did not contain
+                  # the required candidate values. This is malformed
+                  # candidate content and must continue to fail.
+                  if invalid_candidate_rows:
+                      diagnostic = " | ".join(
+                          invalid_candidate_rows[-12:]
+                      )
 
-                  raise SystemExit(
-                      "The CDT candidate header was found in "
-                      + candidate_file
-                      + " using "
-                      + delimiter_name
-                      + ", but no candidate rows were found after it."
+                      raise SystemExit(
+                          "The CDT candidate header was found in "
+                          + candidate_file
+                          + ", but content after the header could not "
+                          + "be parsed as valid candidate rows. "
+                          + "Invalid row(s): "
+                          + diagnostic[:2000]
+                      )
+
+                  # CDT generated its normal preamble and recognized
+                  # header, but there are no gateway or cluster rows.
+                  print(
+                      "WARNING: There is no Clusters or Gateway online for CMA: "
+                      + cma_name
                   )
+                  raise SystemExit(0)
 
               minimum_widths = (
                   20,
