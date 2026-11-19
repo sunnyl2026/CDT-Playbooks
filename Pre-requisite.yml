@@ -448,6 +448,309 @@
       register: updated_candidate_files
 
     # ============================================================
+    # Classify candidate files
+    #
+    # A valid CDT file with its normal preamble and recognizable
+    # candidate header, but no candidate rows, is a warning condition.
+    # Missing files, empty files, unrecognized headers, and malformed
+    # candidate rows remain genuine failures.
+    # ============================================================
+
+    - name: Classify each generated candidate CSV
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+              import csv
+              import re
+              import sys
+
+              candidate_file = sys.argv[1]
+
+              required_keys = (
+                  "gatewayname",
+                  "clustername",
+                  "ipaddress",
+                  "versionjhftake",
+                  "state",
+                  "upgradeorder",
+              )
+
+              header_aliases = {
+                  "gatewayname": {
+                      "gatewayname",
+                      "gateway",
+                  },
+                  "clustername": {
+                      "clustername",
+                      "cluster",
+                  },
+                  "ipaddress": {
+                      "ipaddress",
+                      "ipaddr",
+                      "ip",
+                  },
+                  "versionjhftake": {
+                      "versionjhftake",
+                      "versionjhftakelevel",
+                      "versionjhf",
+                      "versiontake",
+                  },
+                  "state": {
+                      "state",
+                      "status",
+                  },
+                  "upgradeorder": {
+                      "upgradeorder",
+                      "upgradeord",
+                      "order",
+                  },
+              }
+
+              def clean_text(value):
+                  return (
+                      value.replace("\ufeff", "")
+                      .replace("\x00", "")
+                      .strip()
+                      .strip('"')
+                      .strip("'")
+                      .strip()
+                  )
+
+              def normalized_header(value):
+                  return re.sub(
+                      r"[^a-z0-9]+",
+                      "",
+                      clean_text(value).casefold(),
+                  )
+
+              def map_header(cells):
+                  normalized_cells = [
+                      normalized_header(cell)
+                      for cell in cells
+                  ]
+                  mapping = {}
+
+                  for required_key in required_keys:
+                      for index, value in enumerate(normalized_cells):
+                          if value in header_aliases[required_key]:
+                              mapping[required_key] = index
+                              break
+
+                  if all(key in mapping for key in required_keys):
+                      return mapping
+
+                  return None
+
+              def parse_delimited_line(line, delimiter):
+                  try:
+                      return next(
+                          csv.reader(
+                              [line],
+                              delimiter=delimiter,
+                              skipinitialspace=True,
+                          )
+                      )
+                  except (csv.Error, StopIteration):
+                      return []
+
+              def parse_whitespace_line(line):
+                  return re.split(r"\s{2,}", line.strip())
+
+              with open(candidate_file, "rb") as stream:
+                  raw_content = stream.read()
+
+              text = raw_content.decode("utf-8-sig", errors="replace")
+              text = (
+                  text.replace("\ufeff", "")
+                  .replace("\x00", "")
+                  .replace("\r\n", "\n")
+                  .replace("\r", "\n")
+              )
+
+              # Defensive handling if CDT writes literal escaped
+              # newline sequences instead of physical newlines.
+              if text.count("\n") <= 1 and "\\n" in text:
+                  text = text.replace("\\r\\n", "\n")
+                  text = text.replace("\\n", "\n")
+                  text = text.replace("\\r", "\n")
+
+              lines = text.splitlines()
+              parser_kind = None
+              parser_value = None
+              header_index = None
+              header_mapping = None
+              delimiter_candidates = (",", ";", "|", "\t")
+
+              # Search the whole file because CDT writes a preamble
+              # before its candidate header.
+              for line_index, line in enumerate(lines):
+                  cleaned_line = clean_text(line)
+
+                  if not cleaned_line:
+                      continue
+
+                  for delimiter in delimiter_candidates:
+                      if delimiter not in line:
+                          continue
+
+                      cells = parse_delimited_line(line, delimiter)
+                      mapping = map_header(cells)
+
+                      if mapping is not None:
+                          parser_kind = "delimiter"
+                          parser_value = delimiter
+                          header_index = line_index
+                          header_mapping = mapping
+                          break
+
+                  if header_mapping is not None:
+                      break
+
+                  cells = parse_whitespace_line(cleaned_line)
+                  mapping = map_header(cells)
+
+                  if mapping is not None:
+                      parser_kind = "whitespace"
+                      header_index = line_index
+                      header_mapping = mapping
+                      break
+
+              if header_mapping is None:
+                  diagnostic_lines = [
+                      clean_text(line)
+                      for line in lines
+                      if clean_text(line)
+                  ]
+                  diagnostic = " | ".join(diagnostic_lines[-12:])
+                  raise SystemExit(
+                      "Could not identify the CDT candidate header in "
+                      + candidate_file
+                      + ". File tail: "
+                      + diagnostic[:2000]
+                  )
+
+              max_required_index = max(header_mapping.values())
+              candidate_rows = []
+              invalid_candidate_rows = []
+
+              for line in lines[header_index + 1:]:
+                  cleaned_line = clean_text(line)
+
+                  if not cleaned_line:
+                      continue
+
+                  if re.fullmatch(r"[-=*#_+\s]+", cleaned_line):
+                      continue
+
+                  if parser_kind == "delimiter":
+                      cells = parse_delimited_line(line, parser_value)
+                  else:
+                      cells = parse_whitespace_line(cleaned_line)
+
+                  cells = [clean_text(cell) for cell in cells]
+
+                  if len(cells) <= max_required_index:
+                      if (
+                          parser_kind == "delimiter"
+                          and parser_value in line
+                      ) or (
+                          parser_kind == "whitespace"
+                          and len(cells) > 1
+                      ):
+                          invalid_candidate_rows.append(cleaned_line)
+                      continue
+
+                  if map_header(cells) is not None:
+                      continue
+
+                  values = tuple(
+                      cells[header_mapping[key]]
+                      for key in required_keys
+                  )
+
+                  # A real candidate must identify a gateway or cluster
+                  # and must contain its IP address.
+                  if not (values[0] or values[1]) or not values[2]:
+                      invalid_candidate_rows.append(cleaned_line)
+                      continue
+
+                  candidate_rows.append(values)
+
+              if candidate_rows:
+                  print("READY")
+                  raise SystemExit(0)
+
+              if invalid_candidate_rows:
+                  diagnostic = " | ".join(invalid_candidate_rows[-12:])
+                  raise SystemExit(
+                      "The CDT candidate header was found in "
+                      + candidate_file
+                      + ", but content after the header could not be "
+                      + "parsed as valid candidate rows. Invalid row(s): "
+                      + diagnostic[:2000]
+                  )
+
+              # The file has a valid CDT header but no candidate rows.
+              print("NO_CANDIDATES")
+          - "{{ candidates_dir }}/{{ item.cma_name }}_PR_candidates.csv"
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+      register: candidate_file_classifications
+      changed_when: false
+
+    - name: Initialize candidate execution groups
+      ansible.builtin.set_fact:
+        executable_cmas: []
+        no_candidate_cmas: []
+        no_candidate_cma_names: []
+
+    - name: Build candidate execution groups
+      ansible.builtin.set_fact:
+        executable_cmas: >-
+          {{
+            executable_cmas
+            + (
+                [item.item]
+                if (item.stdout | trim) == 'READY'
+                else []
+              )
+          }}
+        no_candidate_cmas: >-
+          {{
+            no_candidate_cmas
+            + (
+                [item.item]
+                if (item.stdout | trim) == 'NO_CANDIDATES'
+                else []
+              )
+          }}
+        no_candidate_cma_names: >-
+          {{
+            no_candidate_cma_names
+            + (
+                [item.item.cma_name]
+                if (item.stdout | trim) == 'NO_CANDIDATES'
+                else []
+              )
+          }}
+      loop: "{{ candidate_file_classifications.results }}"
+      loop_control:
+        label: "{{ item.item.cma_name }}"
+
+    - name: Show warning for a CMA with no online candidates
+      ansible.builtin.debug:
+        msg: |
+          WARNING: No online gateway or cluster candidates were found for CMA {{ item.cma_name }}.
+          The CDT candidate file contains a valid header but no candidate rows.
+          CentralDeploymentTool -execute will be skipped for this CMA.
+      loop: "{{ no_candidate_cmas }}"
+      loop_control:
+        label: "{{ item.cma_name }}"
+
+    # ============================================================
     # Show readable per-CMA candidate summaries
     # ============================================================
 
@@ -480,17 +783,29 @@
           Job ID:
           {{ normalized_job_id }}
 
-          CMA count:
+          Selected CMA count:
           {{ selected_targets_data.selected_cmas | length }}
+
+          CMA count with candidates to execute:
+          {{ executable_cmas | length }}
+
+          CMA count skipped with warnings:
+          {{ no_candidate_cmas | length }}
 
           Generated candidates:
           {% for cma in selected_targets_data.selected_cmas %}
           - {{ cma.cma_name }}
             Server: {{ cma.cma_ip }}
             Candidates: {{ candidates_dir }}/{{ cma.cma_name }}_PR_candidates.csv
+          {% if cma.cma_name in no_candidate_cma_names %}
+            Status: WARNING - valid candidate header, but no online gateway or cluster candidate rows; execution will be skipped
+          {% else %}
+            Status: READY FOR EXECUTION
+          {% endif %}
           {% endfor %}
 
-          Candidate files have been validated and will now be executed.
+          Candidate files have been validated. Only CMAs with valid
+          candidate rows will now be executed.
           ============================================================
 
     # ============================================================
@@ -537,7 +852,7 @@
           - {{ target.name }} ({{ target.type }})
           {% endfor %}
           ============================================================
-      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop: "{{ executable_cmas }}"
       loop_control:
         label: "{{ item.cma_name }}"
 
@@ -548,7 +863,7 @@
     # Candidate files are revalidated inside the execution shell.
     # ============================================================
 
-    - name: Start approved deployment plan execution for all CMAs in parallel
+    - name: Start approved deployment plan execution for CMAs with candidates in parallel
       ansible.builtin.shell:
         cmd: |
           /bin/bash --login <<'CDT_EXECUTE_LOGIN_SHELL'
@@ -612,7 +927,7 @@
         executable: /bin/bash
       async: 7200
       poll: 0
-      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop: "{{ executable_cmas }}"
       loop_control:
         label: "{{ item.cma_name }}"
       register: deployment_execution_async_jobs
@@ -659,7 +974,7 @@
     - name: Check deployment execution return-code files
       ansible.builtin.stat:
         path: "{{ execution_results_dir }}/{{ item.cma_name }}.rc"
-      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop: "{{ executable_cmas }}"
       loop_control:
         label: "{{ item.cma_name }}"
       register: deployment_execution_rc_stats
@@ -667,7 +982,7 @@
     - name: Check deployment execution stdout files
       ansible.builtin.stat:
         path: "{{ execution_results_dir }}/{{ item.cma_name }}.stdout"
-      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop: "{{ executable_cmas }}"
       loop_control:
         label: "{{ item.cma_name }}"
       register: deployment_execution_stdout_stats
@@ -675,7 +990,7 @@
     - name: Check deployment execution stderr files
       ansible.builtin.stat:
         path: "{{ execution_results_dir }}/{{ item.cma_name }}.stderr"
-      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop: "{{ executable_cmas }}"
       loop_control:
         label: "{{ item.cma_name }}"
       register: deployment_execution_stderr_stats
@@ -690,20 +1005,20 @@
           One or more deployment execution result files are missing.
 
           CMA:
-          {{ selected_targets_data.selected_cmas[item].cma_name }}
+          {{ executable_cmas[item].cma_name }}
 
           Expected files:
-          {{ execution_results_dir }}/{{ selected_targets_data.selected_cmas[item].cma_name }}.rc
-          {{ execution_results_dir }}/{{ selected_targets_data.selected_cmas[item].cma_name }}.stdout
-          {{ execution_results_dir }}/{{ selected_targets_data.selected_cmas[item].cma_name }}.stderr
-      loop: "{{ range(0, selected_targets_data.selected_cmas | length) | list }}"
+          {{ execution_results_dir }}/{{ executable_cmas[item].cma_name }}.rc
+          {{ execution_results_dir }}/{{ executable_cmas[item].cma_name }}.stdout
+          {{ execution_results_dir }}/{{ executable_cmas[item].cma_name }}.stderr
+      loop: "{{ range(0, executable_cmas | length) | list }}"
       loop_control:
-        label: "{{ selected_targets_data.selected_cmas[item].cma_name }}"
+        label: "{{ executable_cmas[item].cma_name }}"
 
     - name: Read deployment execution return codes
       ansible.builtin.slurp:
         src: "{{ execution_results_dir }}/{{ item.cma_name }}.rc"
-      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop: "{{ executable_cmas }}"
       loop_control:
         label: "{{ item.cma_name }}"
       register: deployment_execution_rc_files
@@ -711,7 +1026,7 @@
     - name: Read deployment execution standard output
       ansible.builtin.slurp:
         src: "{{ execution_results_dir }}/{{ item.cma_name }}.stdout"
-      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop: "{{ executable_cmas }}"
       loop_control:
         label: "{{ item.cma_name }}"
       register: deployment_execution_stdout_files
@@ -719,7 +1034,7 @@
     - name: Read deployment execution standard error
       ansible.builtin.slurp:
         src: "{{ execution_results_dir }}/{{ item.cma_name }}.stderr"
-      loop: "{{ selected_targets_data.selected_cmas }}"
+      loop: "{{ executable_cmas }}"
       loop_control:
         label: "{{ item.cma_name }}"
       register: deployment_execution_stderr_files
@@ -728,10 +1043,10 @@
       ansible.builtin.debug:
         msg: |
           ============================================================
-          CMA: {{ selected_targets_data.selected_cmas[item].cma_name }}
-          CMA IP: {{ selected_targets_data.selected_cmas[item].cma_ip }}
-          Session: {{ selected_targets_data.selected_cmas[item].cma_name }}_session
-          Candidate file: {{ candidates_dir }}/{{ selected_targets_data.selected_cmas[item].cma_name }}_PR_candidates.csv
+          CMA: {{ executable_cmas[item].cma_name }}
+          CMA IP: {{ executable_cmas[item].cma_ip }}
+          Session: {{ executable_cmas[item].cma_name }}_session
+          Candidate file: {{ candidates_dir }}/{{ executable_cmas[item].cma_name }}_PR_candidates.csv
           Deployment plan: {{ deployment_plan }}
           Return code: {{ deployment_execution_rc_files.results[item].content | b64decode | trim }}
 
@@ -741,9 +1056,9 @@
           Standard error:
           {{ deployment_execution_stderr_files.results[item].content | b64decode | trim }}
           ============================================================
-      loop: "{{ range(0, selected_targets_data.selected_cmas | length) | list }}"
+      loop: "{{ range(0, executable_cmas | length) | list }}"
       loop_control:
-        label: "{{ selected_targets_data.selected_cmas[item].cma_name }}"
+        label: "{{ executable_cmas[item].cma_name }}"
 
     - name: Stop if any approved deployment execution failed
       ansible.builtin.assert:
@@ -762,16 +1077,16 @@
           Approved deployment plan execution failed.
 
           CMA:
-          {{ selected_targets_data.selected_cmas[item].cma_name }}
+          {{ executable_cmas[item].cma_name }}
 
           CMA IP:
-          {{ selected_targets_data.selected_cmas[item].cma_ip }}
+          {{ executable_cmas[item].cma_ip }}
 
           Session:
-          {{ selected_targets_data.selected_cmas[item].cma_name }}_session
+          {{ executable_cmas[item].cma_name }}_session
 
           Candidate file:
-          {{ candidates_dir }}/{{ selected_targets_data.selected_cmas[item].cma_name }}_PR_candidates.csv
+          {{ candidates_dir }}/{{ executable_cmas[item].cma_name }}_PR_candidates.csv
 
           Deployment plan:
           {{ deployment_plan }}
@@ -784,9 +1099,9 @@
 
           Standard error:
           {{ deployment_execution_stderr_files.results[item].content | b64decode | trim }}
-      loop: "{{ range(0, selected_targets_data.selected_cmas | length) | list }}"
+      loop: "{{ range(0, executable_cmas | length) | list }}"
       loop_control:
-        label: "{{ selected_targets_data.selected_cmas[item].cma_name }}"
+        label: "{{ executable_cmas[item].cma_name }}"
 
     # ============================================================
     # Final execution summary
@@ -802,14 +1117,23 @@
           Job ID:
           {{ normalized_job_id }}
 
-          CMA count:
+          Selected CMA count:
           {{ selected_targets_data.selected_cmas | length }}
+
+          Executed CMA count:
+          {{ executable_cmas | length }}
+
+          Skipped CMA count:
+          {{ no_candidate_cmas | length }}
 
           Deployment plan:
           {{ deployment_plan }}
 
           Execution results:
-          {% for cma in selected_targets_data.selected_cmas %}
+          {% if executable_cmas | length == 0 %}
+          - None. No CMA had an online gateway or cluster candidate row.
+          {% else %}
+          {% for cma in executable_cmas %}
           {% set cma_index = loop.index0 %}
           - CMA: {{ cma.cma_name }}
             Server: {{ cma.cma_ip }}
@@ -822,6 +1146,21 @@
             Return code: {{ deployment_execution_rc_files.results[cma_index].content | b64decode | trim }}
             Status: SUCCESS
           {% endfor %}
+          {% endif %}
 
-          All approved CMA deployment plan executions completed successfully.
+          Skipped CMAs:
+          {% if no_candidate_cmas | length == 0 %}
+          - None
+          {% else %}
+          {% for cma in no_candidate_cmas %}
+          - CMA: {{ cma.cma_name }}
+            Server: {{ cma.cma_ip }}
+            Candidates: {{ candidates_dir }}/{{ cma.cma_name }}_PR_candidates.csv
+            Status: WARNING - no online gateway or cluster candidates; CentralDeploymentTool -execute was not run
+          {% endfor %}
+          {% endif %}
+
+          All CMAs with valid candidate rows completed successfully.
+          CMAs without candidate rows were skipped with warnings.
           ============================================================
+
