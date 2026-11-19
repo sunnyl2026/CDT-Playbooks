@@ -1,0 +1,788 @@
+---
+- name: Display CDT Gateway Pre-Requisite Overall Results
+  hosts: all
+  gather_facts: false
+  become: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    filters_base_dir: "/var/log/CDT_Project/Filters"
+    candidates_dir: "/var/log/CDT_Project/candidates"
+    gateway_logs_dir: "/var/log/CDT_Project/Gateway_Logs"
+
+    # Internal mailcow relay. These can be overridden by AWX extra vars.
+    smtp_host: "172.20.50.29"
+    smtp_port: 25
+    mail_sender: "awx@hkps.cp"
+    mail_recipients:
+      - "sunny@hkps.cp"
+  tasks:
+    # ============================================================
+    # 1. Validate job_id from AWX Workflow survey
+    # ============================================================
+    - name: Validate job_id
+      ansible.builtin.assert:
+        that:
+          - job_id is defined
+          - job_id | string | trim | length > 0
+          - job_id | string | trim is match('^[A-Za-z0-9_.-]+$')
+        fail_msg: |
+          ERROR: The AWX Workflow survey variable "job_id"
+          is missing or invalid.
+          Example:
+          CHG0012345
+          Allowed characters:
+          Letters, numbers, underscore, hyphen and period.
+    - name: Normalize job_id
+      ansible.builtin.set_fact:
+        deployment_job_id: "{{ job_id | string | trim }}"
+    - name: Define selected targets file
+      ansible.builtin.set_fact:
+        selected_targets_file: >-
+          {{ filters_base_dir }}/{{ deployment_job_id }}/selected_targets.yml
+    # ============================================================
+    # 2. Validate selected_targets.yml
+    # ============================================================
+    - name: Check selected_targets.yml
+      ansible.builtin.stat:
+        path: "{{ selected_targets_file }}"
+      register: selected_targets_stat
+    - name: Stop when selected_targets.yml does not exist
+      ansible.builtin.fail:
+        msg: |
+          ERROR: selected_targets.yml was not found.
+          Job ID:
+          {{ deployment_job_id }}
+          Expected file:
+          {{ selected_targets_file }}
+      when: not selected_targets_stat.stat.exists
+    - name: Stop when selected_targets.yml is not a regular file
+      ansible.builtin.fail:
+        msg: |
+          ERROR: The selected target path is not a regular file.
+          Path:
+          {{ selected_targets_file }}
+      when:
+        - selected_targets_stat.stat.exists
+        - not selected_targets_stat.stat.isreg
+    - name: Stop when selected_targets.yml is not readable
+      ansible.builtin.fail:
+        msg: |
+          ERROR: The AWX SSH account cannot read:
+          {{ selected_targets_file }}
+          This playbook does not use privilege escalation.
+          Check the file and parent-directory permissions.
+      when:
+        - selected_targets_stat.stat.exists
+        - not selected_targets_stat.stat.readable
+    # ============================================================
+    # 3. Read selected_targets.yml
+    # ============================================================
+    - name: Read selected_targets.yml
+      ansible.builtin.slurp:
+        src: "{{ selected_targets_file }}"
+      register: selected_targets_raw
+    - name: Parse selected_targets.yml
+      ansible.builtin.set_fact:
+        selected_targets_data: >-
+          {{
+            selected_targets_raw.content
+            | b64decode
+            | from_yaml
+          }}
+    - name: Validate selected_targets.yml structure
+      ansible.builtin.assert:
+        that:
+          - selected_targets_data is mapping
+          - selected_targets_data.selected_cmas is defined
+          - selected_targets_data.selected_cmas is iterable
+          - selected_targets_data.selected_cmas | length > 0
+        fail_msg: |
+          ERROR: No selected_cmas list was found in:
+          {{ selected_targets_file }}
+          Expected structure:
+          selected_cmas:
+            - cma_name: CMA2_SMS1
+              cma_ip: 172.20.50.41
+              targets:
+                - name: CXL103
+                  type: Cluster
+    # ============================================================
+    # 4. Build selected CMA list
+    # ============================================================
+    - name: Initialize selected CMA list
+      ansible.builtin.set_fact:
+        selected_cma_names: []
+    - name: Add selected CMA names
+      ansible.builtin.set_fact:
+        selected_cma_names: >-
+          {{
+            selected_cma_names
+            +
+            [item.cma_name | string | trim]
+          }}
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      when:
+        - item.cma_name is defined
+        - item.cma_name | string | trim | length > 0
+      loop_control:
+        label: "{{ item.cma_name | default('Missing CMA name') }}"
+    - name: Remove duplicate CMA names
+      ansible.builtin.set_fact:
+        selected_cma_names: >-
+          {{
+            selected_cma_names
+            | unique
+            | list
+          }}
+    - name: Validate selected CMA list
+      ansible.builtin.assert:
+        that:
+          - selected_cma_names | length > 0
+        fail_msg: |
+          ERROR: No valid CMA names were found in:
+          {{ selected_targets_file }}
+    - name: Validate CMA name characters
+      ansible.builtin.assert:
+        that:
+          - item is match('^[A-Za-z0-9_.-]+$')
+        fail_msg: |
+          ERROR: Invalid CMA name:
+          {{ item }}
+          Allowed characters:
+          Letters, numbers, underscore, hyphen and period.
+      loop: "{{ selected_cma_names }}"
+      loop_control:
+        label: "{{ item }}"
+    # ============================================================
+    # 5. Check candidate CSV files
+    #
+    # Expected filename:
+    #
+    # /var/log/CDT_Project/candidates/
+    #     <cma_name>_PR_candidates.csv
+    # ============================================================
+    - name: Check CMA candidate CSV files
+      ansible.builtin.stat:
+        path: "{{ candidates_dir }}/{{ item }}_PR_candidates.csv"
+      loop: "{{ selected_cma_names }}"
+      register: candidate_csv_stats
+      loop_control:
+        label: "{{ item }}"
+    - name: Report missing candidate CSV
+      ansible.builtin.debug:
+        msg:
+          Result: "Candidate CSV was not found"
+          CMA_Name: "{{ item.item }}"
+          Expected_File: >-
+            {{ candidates_dir }}/{{ item.item }}_PR_candidates.csv
+      loop: "{{ candidate_csv_stats.results }}"
+      when: not item.stat.exists
+      loop_control:
+        label: "{{ item.item }}"
+    - name: Report unreadable candidate CSV
+      ansible.builtin.debug:
+        msg:
+          Result: "Candidate CSV is not readable"
+          CMA_Name: "{{ item.item }}"
+          Candidate_File: >-
+            {{ candidates_dir }}/{{ item.item }}_PR_candidates.csv
+      loop: "{{ candidate_csv_stats.results }}"
+      when:
+        - item.stat.exists
+        - not item.stat.readable
+      loop_control:
+        label: "{{ item.item }}"
+    # ============================================================
+    # 6. Extract CMA, gateway and cluster mapping
+    #
+    # Candidate CSV example:
+    #
+    # Gateway Name, Cluster Name, IP Address, ...
+    # GW101, CXL103, 172.20.50.101, ...
+    # GW102, CXL103, 172.20.50.102, ...
+    #
+    # Temporary output:
+    #
+    # CMA2_SMS1|GW101|CXL103
+    # CMA2_SMS1|GW102|CXL103
+    # CMA3_SMS1|R8120GW202|
+    # ============================================================
+    - name: Extract gateway and cluster mapping
+      ansible.builtin.shell: |
+        awk -F',' -v cma="{{ item.item }}" '
+          {
+              gateway = $1
+              cluster = $2
+              gsub(/^[[:space:]]+/, "", gateway)
+              gsub(/[[:space:]]+$/, "", gateway)
+              gsub(/\r$/, "", gateway)
+              gsub(/^[[:space:]]+/, "", cluster)
+              gsub(/[[:space:]]+$/, "", cluster)
+              gsub(/\r$/, "", cluster)
+              if (gateway == "") {
+                  next
+              }
+              if (gateway == "Gateway Name") {
+                  next
+              }
+              if (gateway == "Central Deployment Tool Candidates List:") {
+                  next
+              }
+              if (gateway ~ /^[*#=+-]+$/) {
+                  next
+              }
+              if (gateway !~ /^[A-Za-z0-9_.-]+$/) {
+                  next
+              }
+              if (cluster !~ /^[A-Za-z0-9_.-]*$/) {
+                  cluster = ""
+              }
+              print cma "|" gateway "|" cluster
+          }
+        ' "{{ candidates_dir }}/{{ item.item }}_PR_candidates.csv"
+      args:
+        executable: /bin/bash
+      loop: "{{ candidate_csv_stats.results }}"
+      when:
+        - item.stat.exists
+        - item.stat.isreg
+        - item.stat.readable
+      register: gateway_mapping_raw
+      changed_when: false
+      failed_when: false
+      loop_control:
+        label: "{{ item.item }}"
+    # ============================================================
+    # 7. Build structured gateway target list
+    #
+    # Result:
+    #
+    # gateway_targets:
+    #   - cma_name: CMA2_SMS1
+    #     cluster_name: CXL103
+    #     gateway_name: GW101
+    # ============================================================
+    - name: Initialize gateway target list
+      ansible.builtin.set_fact:
+        gateway_targets: []
+    - name: Build gateway target list
+      ansible.builtin.set_fact:
+        gateway_targets: >-
+          {{
+            gateway_targets
+            +
+            [
+              {
+                'cma_name':
+                  (item.1.split('|')[0] | trim),
+                'gateway_name':
+                  (item.1.split('|')[1] | trim),
+                'cluster_name':
+                  (
+                    item.1.split('|')[2] | trim
+                    if item.1.split('|') | length > 2
+                    else ''
+                  )
+              }
+            ]
+          }}
+      with_subelements:
+        - "{{ gateway_mapping_raw.results | default([]) }}"
+        - stdout_lines
+        - skip_missing: true
+      when:
+        - item.1 is defined
+        - item.1 | trim | length > 0
+        - item.1.split('|') | length >= 2
+      loop_control:
+        label: "{{ item.1 }}"
+    - name: Stop when no gateways were discovered
+      ansible.builtin.fail:
+        msg: |
+          ERROR: No gateway entries were found in the
+          candidate CSV files.
+          CMAs checked:
+          {{ selected_cma_names | join(', ') }}
+          Candidate directory:
+          {{ candidates_dir }}
+      when: gateway_targets | length == 0
+    # ============================================================
+    # 8. Remove duplicate gateway target entries
+    #
+    # Duplicate entries are unlikely, but this prevents the same
+    # gateway from being processed more than once.
+    # ============================================================
+    - name: Initialize unique gateway target list
+      ansible.builtin.set_fact:
+        unique_gateway_targets: []
+    - name: Add unique gateway targets
+      ansible.builtin.set_fact:
+        unique_gateway_targets: >-
+          {{
+            unique_gateway_targets
+            +
+            [item]
+          }}
+      loop: "{{ gateway_targets }}"
+      when: >-
+        item.gateway_name
+        not in
+        (
+          unique_gateway_targets
+          | map(attribute='gateway_name')
+          | list
+        )
+      loop_control:
+        label: "{{ item.gateway_name }}"
+    - name: Use unique gateway target list
+      ansible.builtin.set_fact:
+        gateway_targets: "{{ unique_gateway_targets }}"
+    # ============================================================
+    # 9. Check gateway pre-requisite log files
+    #
+    # Expected:
+    #
+    # /var/log/CDT_Project/Gateway_Logs/
+    #     GW101_pre_requisite_check.log
+    # ============================================================
+    - name: Check gateway pre-requisite logs
+      ansible.builtin.stat:
+        path: >-
+          {{ gateway_logs_dir }}/{{ item.gateway_name }}_pre_requisite_check.log
+      loop: "{{ gateway_targets }}"
+      register: gateway_log_stats
+      loop_control:
+        label: "{{ item.gateway_name }}"
+    # ============================================================
+    # 10. Report missing or unreadable gateway logs
+    # ============================================================
+    - name: Report missing gateway log
+      ansible.builtin.debug:
+        msg:
+          CMA_Name: "{{ item.item.cma_name }}"
+          Cluster_Name: >-
+            {{
+              item.item.cluster_name
+              if item.item.cluster_name | length > 0
+              else 'N/A'
+            }}
+          Gateway_Name: "{{ item.item.gateway_name }}"
+          Result: "Pre-requisite check log was not found"
+          Expected_File: >-
+            {{ gateway_logs_dir }}/{{ item.item.gateway_name }}_pre_requisite_check.log
+      loop: "{{ gateway_log_stats.results }}"
+      when: not item.stat.exists
+      loop_control:
+        label: "{{ item.item.gateway_name }}"
+    - name: Report unreadable gateway log
+      ansible.builtin.debug:
+        msg:
+          CMA_Name: "{{ item.item.cma_name }}"
+          Cluster_Name: >-
+            {{
+              item.item.cluster_name
+              if item.item.cluster_name | length > 0
+              else 'N/A'
+            }}
+          Gateway_Name: "{{ item.item.gateway_name }}"
+          Result: "Pre-requisite check log is not readable"
+          Log_File: >-
+            {{ gateway_logs_dir }}/{{ item.item.gateway_name }}_pre_requisite_check.log
+      loop: "{{ gateway_log_stats.results }}"
+      when:
+        - item.stat.exists
+        - not item.stat.readable
+      loop_control:
+        label: "{{ item.item.gateway_name }}"
+    # ============================================================
+    # 11. Extract only final prerequisite result
+    #
+    # Required source lines:
+    #
+    # PASS Count         : 6
+    # FAIL Count         : 0
+    # OVERALL STATUS     : PASS
+    #
+    # Output:
+    #
+    # 6|0|PASS
+    # ============================================================
+    - name: Extract overall pre-requisite result
+      ansible.builtin.shell: |
+        awk '
+          BEGIN {
+              in_summary = 0
+              pass_count = ""
+              fail_count = ""
+              overall_status = ""
+          }
+          /PRE-REQUISITE CHECK SUMMARY/ {
+              in_summary = 1
+              next
+          }
+          in_summary && /^[[:space:]]*PASS Count[[:space:]]*:/ {
+              value = $0
+              sub(/^.*:[[:space:]]*/, "", value)
+              gsub(/[[:space:]]+$/, "", value)
+              pass_count = value
+          }
+          in_summary && /^[[:space:]]*FAIL Count[[:space:]]*:/ {
+              value = $0
+              sub(/^.*:[[:space:]]*/, "", value)
+              gsub(/[[:space:]]+$/, "", value)
+              fail_count = value
+          }
+          in_summary && /^[[:space:]]*OVERALL STATUS[[:space:]]*:/ {
+              value = $0
+              sub(/^.*:[[:space:]]*/, "", value)
+              gsub(/[[:space:]]+$/, "", value)
+              overall_status = value
+          }
+          END {
+              if (pass_count == "") {
+                  exit 2
+              }
+              if (fail_count == "") {
+                  exit 3
+              }
+              if (overall_status == "") {
+                  exit 4
+              }
+              print pass_count "|" fail_count "|" overall_status
+          }
+        ' "{{ gateway_logs_dir }}/{{ item.item.gateway_name }}_pre_requisite_check.log"
+      args:
+        executable: /bin/bash
+      loop: "{{ gateway_log_stats.results }}"
+      when:
+        - item.stat.exists
+        - item.stat.isreg
+        - item.stat.readable
+      register: overall_result_raw
+      changed_when: false
+      failed_when: false
+      loop_control:
+        label: "{{ item.item.gateway_name }}"
+    # ============================================================
+    # 12. Report final-result extraction failures
+    #
+    # Return codes:
+    #
+    # 2 = PASS Count missing
+    # 3 = FAIL Count missing
+    # 4 = OVERALL STATUS missing
+    # ============================================================
+    - name: Report missing PASS Count
+      ansible.builtin.debug:
+        msg:
+          CMA_Name: "{{ item.item.item.cma_name }}"
+          Cluster_Name: >-
+            {{
+              item.item.item.cluster_name
+              if item.item.item.cluster_name | length > 0
+              else 'N/A'
+            }}
+          Gateway_Name: "{{ item.item.item.gateway_name }}"
+          Result: "Unable to extract PASS Count"
+          Log_File: >-
+            {{ gateway_logs_dir }}/{{ item.item.item.gateway_name }}_pre_requisite_check.log
+      loop: "{{ overall_result_raw.results | default([]) }}"
+      when:
+        - item.skipped is not defined
+        - item.rc is defined
+        - item.rc == 2
+      loop_control:
+        label: "{{ item.item.item.gateway_name | default('Gateway') }}"
+    - name: Report missing FAIL Count
+      ansible.builtin.debug:
+        msg:
+          CMA_Name: "{{ item.item.item.cma_name }}"
+          Cluster_Name: >-
+            {{
+              item.item.item.cluster_name
+              if item.item.item.cluster_name | length > 0
+              else 'N/A'
+            }}
+          Gateway_Name: "{{ item.item.item.gateway_name }}"
+          Result: "Unable to extract FAIL Count"
+          Log_File: >-
+            {{ gateway_logs_dir }}/{{ item.item.item.gateway_name }}_pre_requisite_check.log
+      loop: "{{ overall_result_raw.results | default([]) }}"
+      when:
+        - item.skipped is not defined
+        - item.rc is defined
+        - item.rc == 3
+      loop_control:
+        label: "{{ item.item.item.gateway_name | default('Gateway') }}"
+    - name: Report missing OVERALL STATUS
+      ansible.builtin.debug:
+        msg:
+          CMA_Name: "{{ item.item.item.cma_name }}"
+          Cluster_Name: >-
+            {{
+              item.item.item.cluster_name
+              if item.item.item.cluster_name | length > 0
+              else 'N/A'
+            }}
+          Gateway_Name: "{{ item.item.item.gateway_name }}"
+          Result: "Unable to extract OVERALL STATUS"
+          Log_File: >-
+            {{ gateway_logs_dir }}/{{ item.item.item.gateway_name }}_pre_requisite_check.log
+      loop: "{{ overall_result_raw.results | default([]) }}"
+      when:
+        - item.skipped is not defined
+        - item.rc is defined
+        - item.rc == 4
+      loop_control:
+        label: "{{ item.item.item.gateway_name | default('Gateway') }}"
+    # ============================================================
+    # 13. Build compact prerequisite result list
+    # ============================================================
+    - name: Initialize prerequisite result list
+      ansible.builtin.set_fact:
+        prerequisite_results: []
+    - name: Build prerequisite result list
+      ansible.builtin.set_fact:
+        prerequisite_results: >-
+          {{
+            prerequisite_results
+            +
+            [
+              {
+                'cma_name':
+                  item.item.item.cma_name,
+                'cluster_name':
+                  (
+                    item.item.item.cluster_name
+                    if item.item.item.cluster_name | length > 0
+                    else 'N/A'
+                  ),
+                'gateway_name':
+                  item.item.item.gateway_name,
+                'pass_count':
+                  (item.stdout.split('|')[0] | trim),
+                'fail_count':
+                  (item.stdout.split('|')[1] | trim),
+                'overall_status':
+                  (item.stdout.split('|')[2] | trim)
+              }
+            ]
+          }}
+      loop: "{{ overall_result_raw.results | default([]) }}"
+      when:
+        - item.skipped is not defined
+        - item.rc is defined
+        - item.rc == 0
+        - item.stdout is defined
+        - item.stdout.split('|') | length == 3
+      loop_control:
+        label: "{{ item.item.item.gateway_name | default('Gateway') }}"
+    # ============================================================
+    # 14. Display only gateway overall result
+    #
+    # This result is intentionally short so AWX displays every
+    # property without truncating the content.
+    # ============================================================
+    - name: Display PRE-REQUISITE CHECK RESULT
+      ansible.builtin.debug:
+        msg:
+          CMA_Name: "{{ item.cma_name }}"
+          Cluster_Name: "{{ item.cluster_name }}"
+          Gateway_Name: "{{ item.gateway_name }}"
+          PASS_Count: "{{ item.pass_count }}"
+          FAIL_Count: "{{ item.fail_count }}"
+          OVERALL_STATUS: "{{ item.overall_status }}"
+      loop: "{{ prerequisite_results }}"
+      loop_control:
+        label: "{{ item.gateway_name }}"
+    # ============================================================
+    # 15. Build overall deployment counters
+    # ============================================================
+    - name: Initialize deployment result counters
+      ansible.builtin.set_fact:
+        passed_gateway_count: 0
+        failed_gateway_count: 0
+        unknown_gateway_count: 0
+        missing_log_count: 0
+        unreadable_log_count: 0
+    - name: Count gateways with PASS overall status
+      ansible.builtin.set_fact:
+        passed_gateway_count: "{{ passed_gateway_count | int + 1 }}"
+      loop: "{{ prerequisite_results }}"
+      when: item.overall_status | upper == 'PASS'
+      loop_control:
+        label: "{{ item.gateway_name }}"
+    - name: Count gateways with FAIL overall status
+      ansible.builtin.set_fact:
+        failed_gateway_count: "{{ failed_gateway_count | int + 1 }}"
+      loop: "{{ prerequisite_results }}"
+      when: item.overall_status | upper == 'FAIL'
+      loop_control:
+        label: "{{ item.gateway_name }}"
+    - name: Count gateways with unknown overall status
+      ansible.builtin.set_fact:
+        unknown_gateway_count: "{{ unknown_gateway_count | int + 1 }}"
+      loop: "{{ prerequisite_results }}"
+      when:
+        - item.overall_status | upper != 'PASS'
+        - item.overall_status | upper != 'FAIL'
+      loop_control:
+        label: "{{ item.gateway_name }}"
+    - name: Count missing gateway logs
+      ansible.builtin.set_fact:
+        missing_log_count: "{{ missing_log_count | int + 1 }}"
+      loop: "{{ gateway_log_stats.results }}"
+      when: not item.stat.exists
+      loop_control:
+        label: "{{ item.item.gateway_name }}"
+    - name: Count unreadable gateway logs
+      ansible.builtin.set_fact:
+        unreadable_log_count: "{{ unreadable_log_count | int + 1 }}"
+      loop: "{{ gateway_log_stats.results }}"
+      when:
+        - item.stat.exists
+        - not item.stat.readable
+      loop_control:
+        label: "{{ item.item.gateway_name }}"
+    # ============================================================
+    # 16. Calculate deployment-level status
+    #
+    # PASS:
+    # - At least one gateway result was extracted.
+    # - Every extracted gateway is PASS.
+    # - No logs are missing or unreadable.
+    #
+    # FAIL:
+    # - Any gateway is FAIL.
+    #
+    # INCOMPLETE:
+    # - No explicit gateway FAIL, but a log/result is unavailable.
+    # ============================================================
+    - name: Calculate deployment overall status
+      ansible.builtin.set_fact:
+        deployment_overall_status: >-
+          {% if failed_gateway_count | int > 0 %}
+          FAIL
+          {% elif
+              missing_log_count | int > 0
+              or unreadable_log_count | int > 0
+              or unknown_gateway_count | int > 0
+              or prerequisite_results | length < gateway_targets | length
+          %}
+          INCOMPLETE
+          {% elif
+              prerequisite_results | length > 0
+              and passed_gateway_count | int == prerequisite_results | length
+          %}
+          PASS
+          {% else %}
+          INCOMPLETE
+          {% endif %}
+    - name: Normalize deployment overall status
+      ansible.builtin.set_fact:
+        deployment_overall_status: >-
+          {{ deployment_overall_status | trim }}
+    # ============================================================
+    # 17. Display final workflow result
+    # ============================================================
+    - name: Display WORKFLOW PRE-REQUISITE RESULT
+      ansible.builtin.debug:
+        msg:
+          Job_ID: "{{ deployment_job_id }}"
+          CMA_Count: "{{ selected_cma_names | length }}"
+          Gateway_Count: "{{ gateway_targets | length }}"
+          Gateway_Result_Count: "{{ prerequisite_results | length }}"
+          Passed_Gateways: "{{ passed_gateway_count }}"
+          Failed_Gateways: "{{ failed_gateway_count }}"
+          Unknown_Gateways: "{{ unknown_gateway_count }}"
+          Missing_Logs: "{{ missing_log_count }}"
+          Unreadable_Logs: "{{ unreadable_log_count }}"
+          WORKFLOW_OVERALL_STATUS: "{{ deployment_overall_status }}"
+
+    # ============================================================
+    # 18. Prepare all gateway logs for the notification email
+    #
+    # The assertion prevents a partial email: the message is sent
+    # only when every gateway in this pre-requisite check has a
+    # readable regular log file available for attachment.
+    # ============================================================
+
+    - name: Initialize email attachment list
+      ansible.builtin.set_fact:
+        email_log_attachments: []
+      run_once: true
+
+    - name: Add readable gateway logs to email attachment list
+      ansible.builtin.set_fact:
+        email_log_attachments: >-
+          {{
+            email_log_attachments
+            +
+            [
+              gateway_logs_dir
+              + '/'
+              + item.item.gateway_name
+              + '_pre_requisite_check.log'
+            ]
+          }}
+      loop: "{{ gateway_log_stats.results }}"
+      when:
+        - item.stat.exists | default(false)
+        - item.stat.isreg | default(false)
+        - item.stat.readable | default(false)
+      loop_control:
+        label: "{{ item.item.gateway_name }}"
+      run_once: true
+
+    - name: Verify every gateway log can be attached
+      ansible.builtin.assert:
+        that:
+          - email_log_attachments | length == gateway_targets | length
+        fail_msg: |
+          ERROR: Notification email was not sent because not every
+          gateway pre-requisite check log is present, regular and readable.
+
+          Expected attachment count: {{ gateway_targets | length }}
+          Available attachment count: {{ email_log_attachments | length }}
+      run_once: true
+
+
+    # ============================================================
+    # 19. Generate notification timestamp
+    # ============================================================
+
+    - name: Generate email timestamp
+      ansible.builtin.command:
+        argv:
+          - date
+          - "+%Y-%m-%d %H:%M:%S %Z"
+      register: email_timestamp_cmd
+      changed_when: false
+      run_once: true
+
+
+    # ============================================================
+    # 20. Send pre-requisite check logs by email
+    #
+    # community.general.mail runs on the managed host so the paths
+    # in email_log_attachments refer to the same host on which the
+    # gateway logs were checked.
+    # ============================================================
+
+    - name: Send CDT pre-requisite check log email
+      community.general.mail:
+        host: "{{ smtp_host }}"
+        port: "{{ smtp_port }}"
+        secure: never
+        from: "{{ mail_sender }}"
+        to: "{{ mail_recipients }}"
+        subject: >-
+          CDT Pre-requisite Check Log for Change ID: {{ deployment_job_id }}
+        subtype: html
+        charset: utf8
+        body: |
+          {{ email_timestamp_cmd.stdout }}<br>
+          This email auto generated after Pre-requisite Check<br>
+        attach: "{{ email_log_attachments }}"
+      run_once: true
+
