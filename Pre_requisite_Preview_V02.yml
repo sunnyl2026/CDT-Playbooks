@@ -66,7 +66,6 @@
 
           ============================================================
 
-
     # ============================================================
     # 2. Validate job folder and selected_targets.yml
     # ============================================================
@@ -118,7 +117,6 @@
       when:
         - selected_targets_stat.stat.exists
         - not selected_targets_stat.stat.isreg
-
 
     # ============================================================
     # 3. Read and parse selected_targets.yml
@@ -176,7 +174,6 @@
           AWX Workflow Survey job_id matches selected_targets.yml:
           {{ normalized_job_id }}
 
-
     # ============================================================
     # 4. Validate CMA and target entries
     # ============================================================
@@ -226,7 +223,6 @@
           /
           {{ item.1.name | default('UNKNOWN') }}
 
-
     # ============================================================
     # 5. Check for duplicate CMA names
     # ============================================================
@@ -250,7 +246,6 @@
 
           CMA list:
           {{ selected_cma_names | to_nice_yaml }}
-
 
     # ============================================================
     # 6. Validate deployment plan and candidate directory
@@ -285,7 +280,6 @@
         path: "{{ candidates_dir }}"
         state: directory
         mode: "0755"
-
 
     # ============================================================
     # 7. Create one PR filter file per CMA
@@ -359,13 +353,11 @@
       loop_control:
         label: "{{ item.item.cma_name }}"
 
-
     # ============================================================
     # 8. Remove old candidate files
     #
-    # IMPORTANT:
-    # An old candidate CSV is removed before CDT runs.
-    # Therefore an offline CMA cannot accidentally reuse an old CSV.
+    # This prevents an old candidate file from making a failed CDT
+    # operation appear successful.
     # ============================================================
 
     - name: Remove previous candidate files
@@ -377,20 +369,14 @@
       loop_control:
         label: "{{ item.cma_name }}"
 
-
     # ============================================================
     # 9. Start CDT generation for all CMAs in parallel
     #
-    # CDT output is captured with tee.
+    # This is the original, previously working CDT command.
+    # No tee, output redirection, or artificial CSV is added.
     #
-    # If CDT reports that there are no online clusters/gateways,
-    # the shell outputs:
-    #
-    # CDT_NO_ONLINE_TARGETS=true
-    #
-    # and returns rc=0 so Ansible can continue.
-    #
-    # Other CDT errors retain the real CDT return code.
+    # /bin/bash -lc runs the complete command in a login shell.
+    # mdsenv and CentralDeploymentTool execute in the same shell.
     # ============================================================
 
     - name: Start filtered CDT generation for all CMAs in parallel
@@ -415,7 +401,6 @@
           cdt_executable="${CDTDIR}/CentralDeploymentTool"
           filter_file="{{ job_folder }}/{{ item.cma_name }}_PR_filter"
           candidate_file="{{ candidates_dir }}/{{ item.cma_name }}_PR_candidates.csv"
-          output_file="/tmp/{{ normalized_job_id }}_{{ item.cma_name }}_cdt_generate.log"
 
           if [[ ! -x "${cdt_executable}" ]]; then
               echo "ERROR: CentralDeploymentTool is not executable"
@@ -435,8 +420,6 @@
               exit 13
           fi
 
-          rm -f "${output_file}"
-
           echo "CDTDIR=${CDTDIR}"
           echo "CDT=${cdt_executable}"
           echo "Session={{ item.cma_name }}_session"
@@ -451,31 +434,15 @@
             -candidates="${candidate_file}" \
             -deploymentplan="{{ deployment_plan }}" \
             -filter="${filter_file}" \
-            -server="{{ item.cma_ip }}" \
-            2>&1 | tee "${output_file}"
+            -server="{{ item.cma_ip }}"
 
-          cdt_rc=${PIPESTATUS[0]}
+          cdt_rc=$?
 
           echo
-          echo "Original CDT return code=${cdt_rc}"
-
-          if grep -Eiq \
-            "There is no[[:space:]]+Clusters?[[:space:]]+or[[:space:]]+Gateways?[[:space:]]+online|No[[:space:]]+Clusters?[[:space:]]+or[[:space:]]+Gateways?[[:space:]]+online" \
-            "${output_file}"; then
-
-              echo
-              echo "CDT_NO_ONLINE_TARGETS=true"
-              echo "WARNING: There is no Clusters or Gateway online for CMA: {{ item.cma_name }}"
-              exit 0
-          fi
-
-          echo "CDT_NO_ONLINE_TARGETS=false"
           echo "CDT return code=${cdt_rc}"
 
           exit "${cdt_rc}"
           '
-      args:
-        executable: /bin/bash
       async: "{{ cdt_async_timeout }}"
       poll: 0
       loop: "{{ selected_targets_data.selected_cmas }}"
@@ -483,7 +450,6 @@
         label: "{{ item.cma_name }}"
       register: filtered_cdt_async_jobs
       changed_when: true
-
 
     # ============================================================
     # 10. Show submitted async jobs
@@ -506,9 +472,11 @@
       loop_control:
         label: "{{ item.item.cma_name }}"
 
-
     # ============================================================
     # 11. Wait for all parallel CDT jobs
+    #
+    # "is finished" avoids the integer conditional warning seen
+    # with finished: 1 on older ansible-core versions.
     # ============================================================
 
     - name: Wait for filtered CDT jobs to complete
@@ -524,9 +492,8 @@
         label: "{{ cdt_async_job.item.cma_name }}"
       failed_when: false
 
-
     # ============================================================
-    # 12. Show raw CDT results
+    # 12. Show real async command results
     # ============================================================
 
     - name: Show filtered CDT command results
@@ -562,97 +529,89 @@
       loop_control:
         label: "{{ item.cdt_async_job.item.cma_name }}"
 
-
     # ============================================================
-    # 13. Classify and validate CDT results
+    # 13. Validate async results and identify the explicit CDT
+    #     no-online-target condition
+    #
+    # The normal CDT command and candidate-generation path above are
+    # unchanged. Only the explicit no-online message is exempted from
+    # the CDT return-code and CSV requirements below.
     # ============================================================
-
-    - name: Initialize CDT result classification
-      ansible.builtin.set_fact:
-        classified_cdt_results: []
-
-    - name: Classify each CDT async result
-      ansible.builtin.set_fact:
-        classified_cdt_results: >-
-          {{
-            classified_cdt_results
-            + [
-                {
-                  'cma_name':
-                    item.cdt_async_job.item.cma_name,
-                  'cma_ip':
-                    item.cdt_async_job.item.cma_ip,
-                  'ansible_job_id':
-                    item.cdt_async_job.ansible_job_id,
-                  'finished':
-                    item.finished | default(false) | bool,
-                  'rc':
-                    item.rc | default(none),
-                  'stdout':
-                    item.stdout | default(''),
-                  'stderr':
-                    item.stderr | default(''),
-                  'no_online_targets':
-                    (
-                      'CDT_NO_ONLINE_TARGETS=true'
-                      in
-                      (
-                        (item.stdout | default(''))
-                        ~ '\n'
-                        ~
-                        (item.stderr | default(''))
-                      )
-                    )
-                }
-              ]
-          }}
-      loop: "{{ cdt_async_poll.results }}"
-      loop_control:
-        label: "{{ item.cdt_async_job.item.cma_name }}"
 
     - name: Stop if an async CDT job did not finish
       ansible.builtin.assert:
         that:
-          - item.finished | bool
+          - item.finished | default(false) | bool
         fail_msg: |
           CDT generation did not finish within the configured timeout.
 
           CMA:
-          {{ item.cma_name }}
+          {{ item.cdt_async_job.item.cma_name }}
 
           CMA IP:
-          {{ item.cma_ip }}
+          {{ item.cdt_async_job.item.cma_ip }}
 
           Async Job ID:
-          {{ item.ansible_job_id }}
+          {{ item.cdt_async_job.ansible_job_id }}
 
           Maximum runtime:
           {{ cdt_async_timeout }} seconds
-      loop: "{{ classified_cdt_results }}"
+      loop: "{{ cdt_async_poll.results }}"
       loop_control:
-        label: "{{ item.cma_name }}"
+        label: "{{ item.cdt_async_job.item.cma_name }}"
 
     - name: Stop if CDT return code is missing
       ansible.builtin.assert:
         that:
-          - item.rc is not none
+          - item.rc is defined
         fail_msg: |
           Ansible marked the async job as finished but did not return
           the command return code.
 
           CMA:
-          {{ item.cma_name }}
+          {{ item.cdt_async_job.item.cma_name }}
 
           CMA IP:
-          {{ item.cma_ip }}
+          {{ item.cdt_async_job.item.cma_ip }}
 
           Async Job ID:
-          {{ item.ansible_job_id }}
-      loop: "{{ classified_cdt_results }}"
-      loop_control:
-        label: "{{ item.cma_name }}"
+          {{ item.cdt_async_job.ansible_job_id }}
 
-    - name: Stop if a real filtered CDT command failure occurred
+          Async result:
+          {{ item | to_nice_yaml }}
+      loop: "{{ cdt_async_poll.results }}"
+      loop_control:
+        label: "{{ item.cdt_async_job.item.cma_name }}"
+
+    - name: Initialize no-online CMA list
+      ansible.builtin.set_fact:
+        no_online_cma_names: []
+
+    - name: Record CMAs for which CDT explicitly reports no online targets
+      ansible.builtin.set_fact:
+        no_online_cma_names: >-
+          {{
+            no_online_cma_names
+            + [item.cdt_async_job.item.cma_name]
+          }}
+      when: >-
+        (
+          (
+            (item.stdout | default(''))
+            ~ '\n'
+            ~ (item.stderr | default(''))
+          )
+          | regex_search(
+              '(?i)(?:there\s+(?:is|are)\s+no|no)'
+              ~ '\s+clusters?\s+or\s+gateways?'
+              ~ '\s+(?:are\s+)?online'
+            )
+        ) is not none
+      loop: "{{ cdt_async_poll.results }}"
+      loop_control:
+        label: "{{ item.cdt_async_job.item.cma_name }}"
+
+    - name: Stop if a genuine filtered CDT command failed
       ansible.builtin.assert:
         that:
           - item.rc | int == 0
@@ -662,58 +621,59 @@
           ============================================================
 
           CMA:
-          {{ item.cma_name }}
+          {{ item.cdt_async_job.item.cma_name }}
 
           CMA IP:
-          {{ item.cma_ip }}
+          {{ item.cdt_async_job.item.cma_ip }}
 
           Return code:
-          {{ item.rc | default('NOT RETURNED', true) }}
+          {{ item.rc | default('NOT RETURNED') }}
 
           Standard output:
           ------------------------------------------------------------
-          {{ item.stdout }}
+          {{ item.stdout | default('') }}
           ------------------------------------------------------------
 
           Standard error:
           ------------------------------------------------------------
-          {{ item.stderr }}
+          {{ item.stderr | default('') }}
           ------------------------------------------------------------
-      when: not item.no_online_targets | bool
-      loop: "{{ classified_cdt_results }}"
+      when: >-
+        item.cdt_async_job.item.cma_name
+        not in no_online_cma_names
+      loop: "{{ cdt_async_poll.results }}"
       loop_control:
-        label: "{{ item.cma_name }}"
+        label: "{{ item.cdt_async_job.item.cma_name }}"
 
-    - name: Show warning when CMA has no online cluster or gateway
+    - name: Show warning when no cluster or gateway is online
       ansible.builtin.debug:
         msg: >-
           WARNING: There is no Clusters or Gateway online for CMA:
           {{ item.cma_name }}
-      when: item.no_online_targets | bool
-      loop: "{{ classified_cdt_results }}"
+      when: item.cma_name in no_online_cma_names
+      loop: "{{ selected_targets_data.selected_cmas }}"
       loop_control:
         label: "{{ item.cma_name }}"
-
 
     # ============================================================
     # 14. Validate generated candidate CSV files
     #
-    # Candidate CSV is required ONLY when the CMA had online
-    # targets.
+    # A candidate CSV remains mandatory unless CDT explicitly
+    # reported that the CMA has no online cluster or gateway.
     #
-    # No empty/fake CSV will be created for an offline CMA.
+    # The playbook does not create an empty or artificial CSV.
     # ============================================================
 
     - name: Check generated candidate CSV files
       ansible.builtin.stat:
         path: >-
           {{ candidates_dir }}/{{ item.cma_name }}_PR_candidates.csv
-      loop: "{{ classified_cdt_results }}"
+      loop: "{{ selected_targets_data.selected_cmas }}"
       loop_control:
         label: "{{ item.cma_name }}"
       register: candidate_file_stats
 
-    - name: Stop if an expected candidate CSV was not generated
+    - name: Stop if a required candidate CSV was not generated
       ansible.builtin.assert:
         that:
           - item.stat.exists
@@ -733,30 +693,29 @@
           Expected file:
           {{ candidates_dir }}/{{ item.item.cma_name }}_PR_candidates.csv
 
-          CDT did not report the no-online-targets condition, but the
-          expected candidate CSV file is missing or empty.
+          The CDT command did not report the no-online-target condition,
+          but the expected candidate CSV file is missing or empty.
           ============================================================
-      when: not item.item.no_online_targets | bool
+      when: item.item.cma_name not in no_online_cma_names
       loop: "{{ candidate_file_stats.results }}"
       loop_control:
         label: "{{ item.item.cma_name }}"
-
-    - name: Show candidate CSV skipped warning for offline CMA
-      ansible.builtin.debug:
-        msg: >-
-          WARNING: There is no Clusters or Gateway online for CMA:
-          {{ item.item.cma_name }}
-      when: item.item.no_online_targets | bool
-      loop: "{{ candidate_file_stats.results }}"
-      loop_control:
-        label: "{{ item.item.cma_name }}"
-
 
     # ============================================================
     # 15. Format generated candidate CSV files for AWX
     #
-    # IMPORTANT:
-    # Offline CMAs are skipped completely here.
+    # The original, previously working parser is retained unchanged.
+    # It is skipped only when CDT explicitly reports no online target.
+    #
+    # The candidate file may contain a CDT text preamble and may
+    # use comma, semicolon, pipe, tab, or aligned whitespace.
+    #
+    # The parser:
+    # - removes BOM and NUL characters;
+    # - ignores case, whitespace, slash and underscore differences;
+    # - accepts alternate field names;
+    # - supports reordered and extra columns;
+    # - extracts only the six required candidate fields.
     # ============================================================
 
     - name: Build readable candidate table for each CMA
@@ -895,6 +854,8 @@
                   .replace("\r", "\n")
               )
 
+              # Defensive handling if CDT writes literal escaped
+              # newline sequences instead of physical newlines.
               if text.count("\n") <= 1 and "\\n" in text:
                   text = text.replace("\\r\\n", "\n")
                   text = text.replace("\\n", "\n")
@@ -914,6 +875,9 @@
                   "\t",
               )
 
+              # Search the whole file, including the CDT preamble.
+              # A line qualifies as a header only when all six
+              # required fields can be identified.
               for line_index, line in enumerate(lines):
                   cleaned_line = clean_text(line)
 
@@ -941,6 +905,8 @@
                   if header_mapping is not None:
                       break
 
+                  # Fallback for fixed or aligned output containing
+                  # two or more spaces between columns.
                   cells = parse_whitespace_line(cleaned_line)
                   mapping = map_header(cells)
 
@@ -982,6 +948,7 @@
                   if not cleaned_line:
                       continue
 
+                  # Ignore visual separator rows.
                   if re.fullmatch(
                       r"[-=*#_+\s]+",
                       cleaned_line,
@@ -1003,9 +970,12 @@
                       for cell in cells
                   ]
 
+                  # Extra columns are accepted. Short preamble,
+                  # footer, and informational lines are ignored.
                   if len(cells) <= max_required_index:
                       continue
 
+                  # Ignore repeated headers in the data section.
                   if map_header(cells) is not None:
                       continue
 
@@ -1014,10 +984,13 @@
                       for key in required_keys
                   )
 
+                  # A valid candidate must have a gateway or cluster
+                  # name and an IP address.
                   if not (values[0] or values[1]):
                       continue
 
-                  if not valuescontinue
+                  if not values[2]:
+                      continue
 
                   candidate_rows.append(values)
 
@@ -1089,16 +1062,17 @@
           - >-
             {{ candidates_dir }}/{{ item.cma_name }}_PR_candidates.csv
           - "{{ item.cma_name }}"
-      loop: "{{ classified_cdt_results }}"
-      when: not item.no_online_targets | bool
+      loop: "{{ selected_targets_data.selected_cmas }}"
+      when: item.cma_name not in no_online_cma_names
       loop_control:
         label: "{{ item.cma_name }}"
       register: formatted_candidate_tables
       changed_when: false
 
-
     # ============================================================
-    # 16. Display candidate summaries
+    # 16. Display candidate summary for approval
+    #
+    # Skipped offline results do not contain stdout_lines.
     # ============================================================
 
     - name: Show Pre-Requisite Check candidate summary
@@ -1111,43 +1085,11 @@
       loop_control:
         label: "{{ item.item.cma_name }}"
 
-    - name: Show offline CMA summary
-      ansible.builtin.debug:
-        msg: |
-          ============================================================
-          WARNING: There is no Clusters or Gateway online for CMA: {{ item.cma_name }}
-          ============================================================
-      when: item.no_online_targets | bool
-      loop: "{{ classified_cdt_results }}"
-      loop_control:
-        label: "{{ item.cma_name }}"
-
-
     # ============================================================
-    # 17. Build final counts
+    # 17. Final workflow approval message
     # ============================================================
 
-    - name: Build final CMA result lists
-      ansible.builtin.set_fact:
-        cmas_with_candidates: >-
-          {{
-            classified_cdt_results
-            | rejectattr('no_online_targets', 'equalto', true)
-            | list
-          }}
-        cmas_without_online_targets: >-
-          {{
-            classified_cdt_results
-            | selectattr('no_online_targets', 'equalto', true)
-            | list
-          }}
-
-
-    # ============================================================
-    # 18. Final workflow approval message
-    # ============================================================
-
-    - name: Show workflow approval message when candidates exist
+    - name: Show workflow approval message
       ansible.builtin.debug:
         msg: |
           ============================================================
@@ -1157,76 +1099,32 @@
           Job ID:
           {{ normalized_job_id }}
 
-          Number of selected CMAs:
-          {{ classified_cdt_results | length }}
+          Number of CMAs:
+          {{ selected_targets_data.selected_cmas | length }}
 
-          CMAs with candidate previews:
-          {{ cmas_with_candidates | length }}
-
-          CMAs without online clusters/gateways:
-          {{ cmas_without_online_targets | length }}
-
-          ------------------------------------------------------------
-          CMA RESULTS
-          ------------------------------------------------------------
-
-          {% for result in classified_cdt_results %}
-          CMA: {{ result.cma_name }}
-          Server: {{ result.cma_ip }}
-          Filter: {{ job_folder }}/{{ result.cma_name }}_PR_filter
-          {% if result.no_online_targets %}
-          Status: WARNING - No clusters or gateways are online
-          Candidates: Not generated
+          Processed CMAs:
+          {% for cma in selected_targets_data.selected_cmas %}
+          - {{ cma.cma_name }}
+            Server: {{ cma.cma_ip }}
+            Filter: {{ job_folder }}/{{ cma.cma_name }}_PR_filter
+          {% if cma.cma_name in no_online_cma_names %}
+            Status: WARNING - No clusters or gateways are online
+            Candidates: Not required; no artificial CSV was created
           {% else %}
-          Status: Candidate preview generated
-          Candidates: {{ candidates_dir }}/{{ result.cma_name }}_PR_candidates.csv
+            Status: Candidate preview generated
+            Candidates: {{ candidates_dir }}/{{ cma.cma_name }}_PR_candidates.csv
           {% endif %}
-
           {% endfor %}
-          ------------------------------------------------------------
+
+          {% if no_online_cma_names | length
+                < selected_targets_data.selected_cmas | length %}
+          Pre-Requisite Check will be run on the online targets shown above.
 
           Review the candidate summaries above and approve the next
           AWX Workflow Approval node to continue.
+          {% else %}
+          No candidate preview is available because no selected cluster
+          or gateway is online. The playbook completed with warnings.
+          {% endif %}
 
           ============================================================
-      when: cmas_with_candidates | length > 0
-
-    - name: Show workflow message when all CMAs are offline
-      ansible.builtin.debug:
-        msg: |
-          ============================================================
-          PRE-REQUISITE CHECK PREVIEW COMPLETED
-          ============================================================
-
-          Job ID:
-          {{ normalized_job_id }}
-
-          Number of selected CMAs:
-          {{ classified_cdt_results | length }}
-
-          CMAs with candidate previews:
-          0
-
-          CMAs without online clusters/gateways:
-          {{ cmas_without_online_targets | length }}
-
-          ------------------------------------------------------------
-          WARNINGS
-          ------------------------------------------------------------
-
-          {% for result in cmas_without_online_targets %}
-          WARNING: There is no Clusters or Gateway online for CMA: {{ result.cma_name }}
-          {% endfor %}
-
-          ------------------------------------------------------------
-
-          No candidate CSV files were generated.
-
-          The playbook completed successfully because no technical CDT
-          failure occurred.
-
-          The next Pre-Requisite Check execution stage should NOT run
-          until at least one selected cluster or gateway is online.
-
-          ============================================================
-      when: cmas_with_candidates | length == 0
