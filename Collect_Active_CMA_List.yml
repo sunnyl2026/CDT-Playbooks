@@ -19,10 +19,18 @@
 
     next_template_id: 30
 
-    # CHECKPOINT_API_KEY and AWX_API_TOKEN are supplied by custom credentials
+    # CHECKPOINT_API_KEY and AWX_OAUTH_TOKEN are supplied by custom credentials
     # attached to this AWX job template. Neither secret is hard-coded here.
     checkpoint_api_key: "{{ lookup('ansible.builtin.env', 'CHECKPOINT_API_KEY') }}"
     awx_host: "http://172.20.50.28:30080"
+
+    # Injected by the existing AWX API Token credential.
+    awx_oauth_token: >-
+      {{
+        lookup('ansible.builtin.env', 'AWX_OAUTH_TOKEN')
+        | default('', true)
+        | trim
+      }}
 
     # Portability settings
     checkpoint_domain: "System Data"
@@ -194,24 +202,36 @@
     - name: Create change inventory and update the next template survey
       when: change_id != report_only_change_id
       block:
+        - name: Check AWX OAuth token presence safely
+          ansible.builtin.set_fact:
+            awx_oauth_token_present: "{{ awx_oauth_token | length > 0 }}"
+          no_log: true
+
+        - name: Display safe AWX API configuration status
+          ansible.builtin.debug:
+            msg:
+              - "AWX Controller URL: {{ awx_host }}"
+              - "Target Job Template ID: {{ next_template_id }}"
+              - "AWX_OAUTH_TOKEN injected: {{ awx_oauth_token_present | bool }}"
+              - "TLS validation enabled: {{ awx_validate_certs }}"
+
         - name: Validate AWX API settings and injected token
           ansible.builtin.assert:
             that:
               - awx_host | trim | length > 0
-              - lookup('ansible.builtin.env', 'AWX_API_TOKEN') | length > 0
+              - awx_oauth_token_present | bool
               - next_template_id | int > 0
             fail_msg: >-
-              awx_host, an AWX_API_TOKEN credential, and a positive
-              next_template_id are required for Task 2.
-          no_log: true
+              AWX API configuration is incomplete.
+              Check the configuration status displayed above.
+              The attached credential must inject AWX_OAUTH_TOKEN.
+            success_msg: "AWX API configuration validated successfully."
 
         - name: Build AWX API headers from the attached credential
           ansible.builtin.set_fact:
-            awx_api_headers: >-
-              {{ dict([
-                ['Authorization', ['Bearer', lookup('ansible.builtin.env', 'AWX_API_TOKEN')] | join(' ')],
-                ['Accept', 'application/json']
-              ]) }}
+            awx_api_headers:
+              Authorization: "Bearer {{ awx_oauth_token }}"
+              Accept: "application/json"
           no_log: true
 
         - name: Create change directory
@@ -222,13 +242,13 @@
 
         - name: Create or overwrite structured CMA file
           ansible.builtin.copy:
-            dest: "{{ inventory_root }}/{{ change_id }}/{{ change_id }}_active_cma_list.csv"
+            dest: "{{ inventory_root }}/{{ change_id }}/{{ change_id }}_active_cma_list.json"
             mode: "0640"
             content: "{{ cma_list | to_nice_json(indent=2) }}\n"
 
         - name: Read structured CMA file
           ansible.builtin.slurp:
-            src: "{{ inventory_root }}/{{ change_id }}/{{ change_id }}_active_cma_list.csv"
+            src: "{{ inventory_root }}/{{ change_id }}/{{ change_id }}_active_cma_list.json"
           register: structured_cma_file
 
         - name: Show structured CMA file in AWX output
@@ -315,6 +335,6 @@
         - name: Show survey update result
           ansible.builtin.debug:
             msg:
-              - "Structured file: {{ inventory_root }}/{{ change_id }}/{{ change_id }}_active_cma_list.csv"
+              - "Structured file: {{ inventory_root }}/{{ change_id }}/{{ change_id }}_active_cma_list.json"
               - "Updated next template ID: {{ next_template_id }}"
               - "CMA choices: {{ cma_choices.split('\n') }}"
