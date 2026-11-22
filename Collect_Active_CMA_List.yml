@@ -158,7 +158,7 @@
 
         - name: Create or overwrite CMA report
           ansible.builtin.copy:
-            dest: "{{ inventory_root }}/{{ report_only_change_id }}/cma_inventory"
+            dest: "{{ inventory_root }}/{{ report_only_change_id }}/cma_inventory.csv"
             mode: "0640"
             content: |
               Creator: {{ requestor_name }}
