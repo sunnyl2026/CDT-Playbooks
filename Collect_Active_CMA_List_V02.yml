@@ -1,0 +1,352 @@
+---
+- name: Collect active CMA list and update Template 30 survey
+  hosts: "{{ mds_host | default('MDS21', true) }}"
+  gather_facts: false
+  become: false
+
+  vars:
+    # ================================================================
+    # EASY-TO-CHANGE SETTINGS
+    # ================================================================
+    next_template_id: 30
+
+    checkpoint_domain: "System Data"
+
+    awx_host: "http://172.20.50.28:30080"
+    awx_validate_certs: true
+
+    # CHECKPOINT_API_KEY is injected by the Check Point API credential
+    checkpoint_api_key: >-
+      {{
+        lookup('ansible.builtin.env', 'CHECKPOINT_API_KEY')
+        | default('', true)
+        | trim
+      }}
+
+    # AWX_OAUTH_TOKEN is injected by the AWX API Token credential
+    awx_oauth_token: >-
+      {{
+        lookup('ansible.builtin.env', 'AWX_OAUTH_TOKEN')
+        | default('', true)
+        | trim
+      }}
+
+  tasks:
+
+    # ================================================================
+    # CHECK POINT - COLLECT ACTIVE CMA INFORMATION
+    # ================================================================
+    - name: Collect domain information from Check Point
+      ansible.builtin.shell: |
+        set +x
+
+        if [ -z "${CHECKPOINT_API_KEY:-}" ]; then
+          echo "CHECKPOINT_DIAG: EMPTY_CREDENTIAL" >&2
+          exit 91
+        fi
+
+        mgmt_cli_path="/opt/CPshrd-R82/bin/mgmt_cli"
+
+        if [ ! -x "$mgmt_cli_path" ]; then
+          echo "CHECKPOINT_DIAG: MGMT_CLI_NOT_FOUND: $mgmt_cli_path" >&2
+          exit 92
+        fi
+
+        "$mgmt_cli_path" \
+          --api-key "$CHECKPOINT_API_KEY" \
+          --domain "{{ checkpoint_domain }}" \
+          show domains \
+          details-level full \
+          --format json
+      args:
+        executable: /bin/bash
+
+      environment:
+        CHECKPOINT_API_KEY: "{{ checkpoint_api_key }}"
+        FWDIR: "/opt/CPmds-R82"
+        CPDIR: "/opt/CPshrd-R82"
+        MDSDIR: "/opt/CPmds-R82"
+        PATH: "/opt/CPshrd-R82/bin:/opt/CPmds-R82/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+      register: domain_result
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+
+    # ================================================================
+    # SANITIZE CHECK POINT OUTPUT
+    # ================================================================
+    - name: Sanitize Check Point command output
+      ansible.builtin.set_fact:
+        domain_stdout_safe: >-
+          {{
+            (domain_result.stdout | default('')
+            | replace(checkpoint_api_key, '********'))
+            if checkpoint_api_key | length > 0
+            else
+            (domain_result.stdout | default(''))
+          }}
+
+        domain_stderr_safe: >-
+          {{
+            (domain_result.stderr | default('')
+            | replace(checkpoint_api_key, '********'))
+            if checkpoint_api_key | length > 0
+            else
+            (domain_result.stderr | default(''))
+          }}
+      no_log: true
+
+
+    - name: Report Check Point command failure safely
+      ansible.builtin.fail:
+        msg: |-
+          mgmt_cli failed on {{ inventory_hostname }}.
+
+          Return code:
+          {{ domain_result.rc | default('unknown') }}
+
+          Diagnosis:
+          {% if domain_result.rc | default(1) | int == 91 %}
+          CHECKPOINT_API_KEY is empty.
+          Verify that the Check Point API credential is attached
+          to this AWX Job Template and injects CHECKPOINT_API_KEY.
+
+          {% elif domain_result.rc | default(1) | int == 92 %}
+          mgmt_cli was not found or is not executable at:
+          /opt/CPshrd-R82/bin/mgmt_cli
+
+          {% else %}
+          mgmt_cli executed but returned a failure.
+          Review the sanitized output below.
+          {% endif %}
+
+          Standard error:
+          {{ domain_stderr_safe | default('(empty)', true) }}
+
+          Standard output:
+          {{ domain_stdout_safe | default('(empty)', true) }}
+      when:
+        - domain_result.rc | default(1) | int != 0
+
+
+    # ================================================================
+    # BUILD ACTIVE CMA LIST IN MEMORY
+    # ================================================================
+    - name: Initialize CMA data
+      ansible.builtin.set_fact:
+        domain_data: "{{ domain_stdout_safe }}"
+        cma_list: []
+
+
+    - name: Build active CMA list
+      ansible.builtin.set_fact:
+        cma_list: >-
+          {{
+            cma_list + [
+              {
+                'mds': item.1['multi-domain-server'],
+                'cma': item.1.name,
+                'ip': item.1['ipv4-address']
+              }
+            ]
+          }}
+      loop: >-
+        {{
+          domain_data.objects
+          | default([])
+          | subelements('servers', skip_missing=True)
+        }}
+      when:
+        - item.1.active | default(false) | bool
+
+      loop_control:
+        label: "{{ item.1.name | default('unknown CMA') }}"
+
+
+    - name: Sort CMA list
+      ansible.builtin.set_fact:
+        cma_list: >-
+          {{
+            cma_list
+            | sort(attribute='cma')
+            | sort(attribute='mds')
+          }}
+
+
+    - name: Stop when no active CMA is found
+      ansible.builtin.assert:
+        that:
+          - cma_list | length > 0
+        fail_msg: >-
+          No active CMA was returned by the Check Point API.
+
+
+    # ================================================================
+    # AWX API VALIDATION
+    # ================================================================
+    - name: Check AWX OAuth token presence safely
+      ansible.builtin.set_fact:
+        awx_oauth_token_present: "{{ awx_oauth_token | length > 0 }}"
+      no_log: true
+
+
+    - name: Display safe AWX API configuration status
+      ansible.builtin.debug:
+        msg:
+          - "AWX Controller URL: {{ awx_host }}"
+          - "Target Job Template ID: {{ next_template_id }}"
+          - "AWX_OAUTH_TOKEN injected: {{ awx_oauth_token_present | bool }}"
+          - "TLS validation enabled: {{ awx_validate_certs }}"
+
+
+    - name: Validate AWX API settings and injected token
+      ansible.builtin.assert:
+        that:
+          - awx_host | trim | length > 0
+          - awx_oauth_token_present | bool
+          - next_template_id | int > 0
+
+        fail_msg: >-
+          AWX API configuration is incomplete.
+          Check the configuration status displayed above.
+          The attached AWX credential must inject AWX_OAUTH_TOKEN.
+
+        success_msg: >-
+          AWX API configuration validated successfully.
+
+
+    - name: Build AWX API headers
+      ansible.builtin.set_fact:
+        awx_api_headers:
+          Authorization: "Bearer {{ awx_oauth_token }}"
+          Accept: "application/json"
+      no_log: true
+
+
+    # ================================================================
+    # BUILD CMA CHOICES FOR TEMPLATE 30
+    # ================================================================
+    - name: Initialize CMA survey choices
+      ansible.builtin.set_fact:
+        cma_choices: []
+
+
+    - name: Build CMA survey choices
+      ansible.builtin.set_fact:
+        cma_choices: >-
+          {{
+            cma_choices
+            + [
+              item.cma
+              ~ '('
+              ~ item.ip
+              ~ ') == '
+              ~ item.mds
+            ]
+          }}
+
+      loop: "{{ cma_list | sort(attribute='cma') }}"
+
+      loop_control:
+        label: "{{ item.cma }}"
+
+
+    - name: Remove duplicate CMA survey choices
+      ansible.builtin.set_fact:
+        cma_choices: "{{ cma_choices | unique | list }}"
+
+
+    # ================================================================
+    # BUILD TEMPLATE 30 SURVEY
+    # ================================================================
+    - name: Build Template 30 survey
+      ansible.builtin.set_fact:
+        updated_questions:
+          - question_name: "Please Select Your Target CMA"
+            question_description: ""
+            required: true
+            type: "multiselect"
+            variable: "target_cmas"
+            choices: "{{ cma_choices }}"
+            default: ""
+
+
+    # ================================================================
+    # CREATE SURVEY ON TEMPLATE 30
+    # ================================================================
+    - name: Create survey on Template 30
+      ansible.builtin.uri:
+        url: >-
+          {{
+            awx_host | regex_replace('/+$', '')
+          }}/api/v2/job_templates/{{ next_template_id }}/survey_spec/
+
+        method: POST
+
+        headers: "{{ awx_api_headers }}"
+
+        body_format: json
+
+        body:
+          name: ""
+          description: ""
+          spec: "{{ updated_questions }}"
+
+        validate_certs: "{{ awx_validate_certs }}"
+
+        status_code:
+          - 200
+          - 201
+
+        return_content: true
+
+      register: survey_update_result
+
+      delegate_to: localhost
+      become: false
+
+      no_log: true
+
+
+    # ================================================================
+    # ENABLE SURVEY ON TEMPLATE 30
+    # ================================================================
+    - name: Enable survey on Template 30
+      ansible.builtin.uri:
+        url: >-
+          {{
+            awx_host | regex_replace('/+$', '')
+          }}/api/v2/job_templates/{{ next_template_id }}/
+
+        method: PATCH
+
+        headers: "{{ awx_api_headers }}"
+
+        body_format: json
+
+        body:
+          survey_enabled: true
+
+        validate_certs: "{{ awx_validate_certs }}"
+
+        status_code:
+          - 200
+
+      delegate_to: localhost
+      become: false
+
+      no_log: true
+
+
+    # ================================================================
+    # FINAL RESULT
+    # ================================================================
+    - name: Show Template 30 survey update result
+      ansible.builtin.debug:
+        msg:
+          - "Template {{ next_template_id }} survey updated successfully."
+          - "Survey enabled: true"
+          - "Active CMA count: {{ cma_list | length }}"
+          - "CMA choices: {{ cma_choices }}"
