@@ -2,7 +2,7 @@
 - name: Collect active CMA inventory
   hosts: "{{ mds_host | default('MDS21', true) }}"
   gather_facts: false
-  become: true
+  become: false
 
   vars:
     # ================================================================
