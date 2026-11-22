@@ -1,0 +1,731 @@
+---
+# Reads the AWX `target_cmas` multiselect, runs one login-shell command on
+# each selected MDS (all of that MDS's selected CMAs are processed inside
+# that one shell), and publishes the generated target choices to the
+# configured target Job Template without deleting its other Survey questions.
+#
+# Expected target_cmas choice format:
+#   CMA1-SMS1(172.20.50.31) | MDS21
+#
+# Published choice formats:
+#   Cluster_Name | CMA_Name(CMA_IP) | MDS_Name
+#   gateway_name | CMA_Name(CMA_IP) | MDS_Name
+#
+# All generated candidate files are overwritten under the variable-controlled
+# temporary-output folder and use this name: <CMA_Name>_inventory.csv.
+# Each CDT session name is exactly: <CMA_Name>_session.
+#
+# CDT candidate output may contain headings and separator lines before the
+# comma-separated rows. Only rows with a valid IPv4 address in column 3 are
+# candidates. Column 1 is the gateway/member name and column 2 is the cluster
+# name, or N/A for a standalone gateway. Cluster members are collapsed to one
+# cluster-name entry.
+
+- name: Parse the selected CMA Survey values and build the MDS execution group
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  # ===============================================================
+  # USER-CONFIGURABLE VARIABLES
+  #
+  # Edit values only in this block. The YAML anchor makes the same values
+  # available to all later plays without duplicating their definitions.
+  # ===============================================================
+  vars: &user_config
+    ansible_python_interpreter: /usr/bin/python3
+
+    # All generated candidate and temporary output is stored here.
+    temp_output_directory: /var/log/CDT_Project/Temp_Output
+
+    # CDT deployment-plan file present on each MDS.
+    deployment_plan_file: /var/log/CDT_Project/Deployment_Plans/inventory.xml
+
+    # AWX controller configuration.
+    awx_controller_url: "http://172.20.50.28:30080"
+    awx_validate_certs: false
+
+    # Target Job Template whose Survey receives the generated choices.
+    # Change this value if a different target Job Template is required.
+    awx_target_job_template_id: 33
+
+    # Survey question to create or replace on the target Job Template.
+    target_survey_variable: selected_target_choices
+    target_survey_question_name: "Select Cluster / Gateway"
+
+    # Attach an AWX credential that exposes this environment variable.
+    awx_oauth_token_environment_variable: AWX_OAUTH_TOKEN
+
+    awx_oauth_token: >-
+      {{
+        lookup(
+          'ansible.builtin.env',
+          awx_oauth_token_environment_variable
+        )
+        | default('', true)
+        | trim
+      }}
+
+    # Input Survey parser. Expected format:
+    # CMA_Name(CMA_IP) | MDS_Name
+    target_cma_pattern: '^\s*(.+?)\s*\(((?:[0-9]{1,3}\.){3}[0-9]{1,3})\)\s*\|\s*(.+?)\s*$'
+
+  tasks:
+    - name: Require the target_cmas Survey answer
+      ansible.builtin.assert:
+        that:
+          - target_cmas is defined
+          - target_cmas | string | trim | length > 0
+        fail_msg: |
+          No CMA was selected.
+
+          Launch this Job Template through the required multiselect Survey
+          whose answer variable is: target_cmas
+
+          Each choice must use this format:
+          CMA_Name(CMA_IP) | MDS_Name
+
+    - name: Normalize target_cmas into a list
+      ansible.builtin.set_fact:
+        target_cma_selections: >-
+          {%- if target_cmas is string -%}
+            {%- set raw = target_cmas | trim -%}
+            {%- if raw.startswith('[') and raw.endswith(']') -%}
+              {{ raw | from_yaml }}
+            {%- else -%}
+              {{
+                (
+                  raw
+                  | regex_replace('\r', '')
+                  | regex_replace(',[ ]*', '\n')
+                ).split('\n')
+                | map('trim')
+                | reject('equalto', '')
+                | list
+              }}
+            {%- endif -%}
+          {%- elif target_cmas is sequence -%}
+            {{ target_cmas | list }}
+          {%- else -%}
+            []
+          {%- endif -%}
+
+    - name: Require at least one normalized CMA selection
+      ansible.builtin.assert:
+        that:
+          - target_cma_selections | length > 0
+        fail_msg: >-
+          target_cmas did not contain any usable Survey selections.
+
+    - name: Initialize parsed CMA records
+      ansible.builtin.set_fact:
+        parsed_target_cmas: []
+
+    - name: Parse valid target_cmas selections
+      ansible.builtin.set_fact:
+        parsed_target_cmas: >-
+          {{
+            parsed_target_cmas
+            +
+            [
+              {
+                'name': selection_match[0][0] | trim,
+                'ip': selection_match[0][1] | trim,
+                'mds': selection_match[0][2] | trim,
+                'source': item | string | trim
+              }
+            ]
+          }}
+      vars:
+        selection_match: >-
+          {{ item | string | regex_findall(target_cma_pattern) }}
+      loop: "{{ target_cma_selections }}"
+      loop_control:
+        label: "{{ item }}"
+      when: selection_match | length == 1
+
+    - name: Require every Survey selection to match the required format
+      ansible.builtin.assert:
+        that:
+          - parsed_target_cmas | length == target_cma_selections | length
+        fail_msg: |
+          One or more target_cmas values are invalid.
+
+          Required format:
+          CMA_Name(CMA_IP) | MDS_Name
+
+          Received:
+          {{ target_cma_selections | to_nice_yaml }}
+
+          Successfully parsed:
+          {{ parsed_target_cmas | map(attribute='source') | list | to_nice_yaml }}
+
+    - name: Initialize CMAs grouped by MDS
+      ansible.builtin.set_fact:
+        cmas_by_mds: {}
+
+    - name: Group the selected CMAs by MDS
+      ansible.builtin.set_fact:
+        cmas_by_mds: >-
+          {{
+            cmas_by_mds
+            | combine(
+                {
+                  item.mds:
+                    (
+                      cmas_by_mds[item.mds]
+                      | default([])
+                    )
+                    + [item]
+                }
+              )
+          }}
+      loop: "{{ parsed_target_cmas }}"
+      loop_control:
+        label: "{{ item.name }} -> {{ item.mds }}"
+
+    - name: Require each selected MDS to exist in the AWX inventory
+      ansible.builtin.assert:
+        that:
+          - item.key in groups['all']
+        fail_msg: |
+          Selected MDS host {{ item.key }} is not present in the AWX inventory.
+
+          Add that exact host name to the inventory attached to this Job
+          Template, including its ansible_host and login credential, or
+          correct the target_cmas Survey choice.
+      loop: "{{ cmas_by_mds | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Add each selected MDS to the temporary execution group
+      ansible.builtin.add_host:
+        name: "{{ item.key }}"
+        groups: selected_mds
+        selected_cmas_for_mds: "{{ item.value }}"
+      loop: "{{ cmas_by_mds | dict2items }}"
+      loop_control:
+        label: >-
+          {{ item.key }}:
+          {{ item.value | map(attribute='name') | list | join(', ') }}
+
+    - name: Display the resolved MDS execution plan
+      ansible.builtin.debug:
+        msg:
+          selected_mds: "{{ cmas_by_mds.keys() | list | sort }}"
+          cmas_by_mds: "{{ cmas_by_mds }}"
+
+
+- name: Generate CDT candidate inventories with one login shell per selected MDS
+  hosts: selected_mds
+  gather_facts: false
+  strategy: linear
+
+  vars:
+    <<: *user_config
+
+    # Everything below is sent to this MDS by one Ansible command task and
+    # executed in one Bash login shell. Every selected CMA assigned to this
+    # MDS is processed inside that same shell.
+    mds_login_shell_script: |
+      set -euo pipefail
+
+      echo "===== MDS LOGIN SHELL ====="
+      echo "MDS: {{ inventory_hostname }}"
+      echo "User: $(whoami)"
+
+      if ! command -v mdsenv >/dev/null 2>&1; then
+          echo "ERROR: mdsenv is unavailable in the login shell on {{ inventory_hostname }}" >&2
+          echo "PATH=${PATH}" >&2
+          exit 20
+      fi
+
+      if ! command -v python3 >/dev/null 2>&1; then
+          echo "ERROR: python3 is unavailable on {{ inventory_hostname }}" >&2
+          exit 21
+      fi
+
+      if [ ! -s {{ deployment_plan_file | quote }} ]; then
+          echo "ERROR: deployment plan is missing or empty: {{ deployment_plan_file }}" >&2
+          exit 22
+      fi
+
+      # All generated candidate output is kept under this folder.
+      mkdir -p {{ temp_output_directory | quote }}
+
+      run_cma() {
+          local cma_name="$1"
+          local cma_ip="$2"
+          local candidate_file
+          local session_name
+          local cdt_rc
+
+          candidate_file={{ temp_output_directory | quote }}/"${cma_name}_inventory.csv"
+          session_name="${cma_name}_session"
+
+          echo "===== CMA ${cma_name} (${cma_ip}) ON {{ inventory_hostname }} ====="
+          echo "Candidate file: ${candidate_file}"
+          echo "CDT session: ${session_name}"
+
+          if ! mdsenv "${cma_name}"; then
+              echo "ERROR: mdsenv failed for ${cma_name} on {{ inventory_hostname }}" >&2
+              return 30
+          fi
+
+          if [ -z "${CDTDIR:-}" ]; then
+              echo "ERROR: CDTDIR is undefined after mdsenv ${cma_name}" >&2
+              return 31
+          fi
+
+          if [ ! -x "${CDTDIR}/CentralDeploymentTool" ]; then
+              echo "ERROR: CentralDeploymentTool is missing or not executable:" >&2
+              echo "${CDTDIR}/CentralDeploymentTool" >&2
+              return 32
+          fi
+
+          # Overwrite behavior: remove an existing file before CDT runs.
+          rm -f -- "${candidate_file}"
+
+          set +e
+          "${CDTDIR}/CentralDeploymentTool" -generate \
+              -session="${session_name}" \
+              -candidates="${candidate_file}" \
+              -deploymentplan={{ deployment_plan_file | quote }} \
+              -server="${cma_ip}"
+          cdt_rc=$?
+          set -e
+
+          if [ "${cdt_rc}" -ne 0 ]; then
+              echo "ERROR: CentralDeploymentTool failed for ${cma_name}; rc=${cdt_rc}" >&2
+              return "${cdt_rc}"
+          fi
+
+          if [ ! -s "${candidate_file}" ]; then
+              echo "ERROR: generated candidate file is missing or empty: ${candidate_file}" >&2
+              return 33
+          fi
+
+          # The CDT file contains prose headings and separator lines followed
+          # by comma-separated candidate rows. Parse every line as CSV, but
+          # accept only rows whose third column is a valid IPv4 address.
+          #
+          # Clustered target:
+          #   Publish the cluster name once and suppress its member names.
+          #
+          # Standalone target:
+          #   Publish the gateway name when the cluster field is N/A.
+          python3 - \
+              "${candidate_file}" \
+              "${cma_name}" \
+              "${cma_ip}" \
+              {{ inventory_hostname | quote }} <<'PY'
+      import csv
+      import ipaddress
+      import sys
+
+      csv_path, cma_name, cma_ip, mds_name = sys.argv[1:5]
+
+      seen = set()
+      emitted = 0
+
+      with open(
+          csv_path,
+          "r",
+          encoding="utf-8-sig",
+          newline=""
+      ) as source:
+          for row in csv.reader(source):
+              if len(row) < 3:
+                  # Prose and separator lines normally land here.
+                  continue
+
+              gateway_name = row[0].strip()
+              cluster_name = row[1].strip()
+              member_ip = row[2].strip()
+
+              try:
+                  ipaddress.IPv4Address(member_ip)
+              except ValueError:
+                  # Headings, separators, and other non-candidate lines may
+                  # contain commas, but column 3 is not a valid IPv4 address.
+                  continue
+
+              if cluster_name.upper() not in {
+                  "",
+                  "N/A",
+                  "NA",
+                  "NONE",
+                  "NULL"
+              }:
+                  # A clustered gateway is represented only by its cluster.
+                  target_name = cluster_name
+              else:
+                  # A standalone gateway is represented by its gateway name.
+                  target_name = gateway_name
+
+              if not target_name:
+                  continue
+
+              # All members of a cluster resolve to the same target name.
+              # Therefore, the cluster is emitted only once for this CMA.
+              dedupe_key = (
+                  target_name,
+                  cma_name,
+                  cma_ip,
+                  mds_name
+              )
+
+              if dedupe_key in seen:
+                  continue
+
+              seen.add(dedupe_key)
+              emitted += 1
+
+              print(
+                  "__AWX_RESULT__"
+                  f"{target_name} | "
+                  f"{cma_name}({cma_ip}) | "
+                  f"{mds_name}"
+              )
+
+      if emitted == 0:
+          print(
+              f"ERROR: no usable cluster or standalone-gateway rows "
+              f"in {csv_path}",
+              file=sys.stderr,
+          )
+          sys.exit(34)
+      PY
+      }
+
+      {% for cma in selected_cmas_for_mds %}
+      run_cma {{ cma.name | quote }} {{ cma.ip | quote }}
+      {% endfor %}
+
+      echo "===== COMPLETED {{ inventory_hostname }} ====="
+
+  tasks:
+    - name: Run all selected CMAs in one login shell on this MDS
+      ansible.builtin.command:
+        argv:
+          - /bin/bash
+          - -l
+          - -c
+          - "{{ mds_login_shell_script }}"
+      register: cdt_batch_result
+      changed_when: true
+      failed_when: cdt_batch_result.rc | int != 0
+
+    - name: Display the non-sensitive MDS execution summary
+      ansible.builtin.debug:
+        msg:
+          mds: "{{ inventory_hostname }}"
+          selected_cmas: >-
+            {{
+              selected_cmas_for_mds
+              | map(attribute='name')
+              | list
+            }}
+          temporary_output_directory: "{{ temp_output_directory }}"
+          return_code: "{{ cdt_batch_result.rc }}"
+          result_row_count: >-
+            {{
+              cdt_batch_result.stdout_lines
+              | default([])
+              | select('match', '^__AWX_RESULT__')
+              | list
+              | length
+            }}
+
+
+- name: Publish generated choices to the configured target Job Template
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    <<: *user_config
+
+  tasks:
+    - name: Initialize the combined generated-choice list
+      ansible.builtin.set_fact:
+        generated_target_choices_raw: []
+
+    - name: Collect generated choices from every selected MDS
+      ansible.builtin.set_fact:
+        generated_target_choices_raw: >-
+          {{
+            generated_target_choices_raw
+            +
+            (
+              hostvars[item].cdt_batch_result.stdout_lines
+              | default([])
+              | select('match', '^__AWX_RESULT__')
+              | map('regex_replace', '^__AWX_RESULT__', '')
+              | list
+            )
+          }}
+      loop: "{{ groups['selected_mds'] }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Build unique sorted target Job Template choices
+      ansible.builtin.set_fact:
+        generated_target_choices: >-
+          {{
+            generated_target_choices_raw
+            | map('trim')
+            | reject('equalto', '')
+            | unique
+            | sort
+            | list
+          }}
+
+    - name: Require at least one generated choice
+      ansible.builtin.assert:
+        that:
+          - generated_target_choices | length > 0
+        fail_msg: >-
+          CDT completed without returning any target choices.
+
+    - name: Display the exact choices that will be forwarded
+      ansible.builtin.debug:
+        msg:
+          target_job_template_id: "{{ awx_target_job_template_id }}"
+          choice_count: "{{ generated_target_choices | length }}"
+          choices: "{{ generated_target_choices }}"
+
+    - name: Validate AWX API configuration
+      ansible.builtin.assert:
+        that:
+          - awx_controller_url | trim | length > 0
+          - not awx_controller_url.endswith('/')
+          - awx_oauth_token | length > 0
+          - awx_target_job_template_id | int > 0
+        fail_msg: |
+          AWX API configuration is incomplete.
+
+          Confirm that the configured controller URL and target Job
+          Template ID are correct, and that the AWX OAuth credential exposes
+          its token through {{ awx_oauth_token_environment_variable }}.
+
+    - name: Verify access to the target Job Template
+      ansible.builtin.uri:
+        url: >-
+          {{ awx_controller_url }}/api/v2/job_templates/{{ awx_target_job_template_id }}/
+        method: GET
+
+        headers:
+          Authorization: "{{ ['Bearer', awx_oauth_token] | join(' ') }}"
+          Accept: application/json
+
+        validate_certs: "{{ awx_validate_certs }}"
+        return_content: true
+        status_code: 200
+
+      register: target_template_result
+      changed_when: false
+      no_log: true
+
+    - name: Retrieve the current target Job Template Survey
+      ansible.builtin.uri:
+        url: >-
+          {{ awx_controller_url }}/api/v2/job_templates/{{ awx_target_job_template_id }}/survey_spec/
+        method: GET
+
+        headers:
+          Authorization: "{{ ['Bearer', awx_oauth_token] | join(' ') }}"
+          Accept: application/json
+
+        validate_certs: "{{ awx_validate_certs }}"
+        return_content: true
+        status_code: 200
+
+      register: current_survey_result
+      changed_when: false
+      no_log: true
+
+    - name: Build the replacement target question and preserve other questions
+      ansible.builtin.set_fact:
+        forwarded_choices_text: >-
+          {{ generated_target_choices | join('\n') }}
+
+        preserved_survey_questions: >-
+          {{
+            current_survey_result.json.spec
+            | default([])
+            | rejectattr(
+                'variable',
+                'equalto',
+                target_survey_variable
+              )
+            | list
+          }}
+
+    - name: Define the target Job Template Survey question
+      ansible.builtin.set_fact:
+        target_survey_question:
+          question_name: "{{ target_survey_question_name }}"
+
+          question_description: >-
+            Select one or more generated clusters or standalone gateways.
+            Cluster members are represented by their cluster name only.
+
+          required: true
+          type: multiselect
+          variable: "{{ target_survey_variable }}"
+          choices: "{{ forwarded_choices_text }}"
+          default: ""
+
+    - name: Build the complete target Job Template Survey specification
+      ansible.builtin.set_fact:
+        updated_survey_spec: >-
+          {{ [target_survey_question] + preserved_survey_questions }}
+
+    - name: Update the target Job Template Survey choices
+      ansible.builtin.uri:
+        url: >-
+          {{ awx_controller_url }}/api/v2/job_templates/{{ awx_target_job_template_id }}/survey_spec/
+        method: POST
+
+        headers:
+          Authorization: "{{ ['Bearer', awx_oauth_token] | join(' ') }}"
+          Accept: application/json
+          Content-Type: application/json
+
+        body_format: json
+
+        body:
+          name: >-
+            {{
+              current_survey_result.json.name
+              | default('Cluster and Gateway Selection', true)
+            }}
+
+          description: >-
+            {{
+              current_survey_result.json.description
+              | default(
+                  'Targets generated from the selected CMAs.',
+                  true
+                )
+            }}
+
+          spec: "{{ updated_survey_spec }}"
+
+        validate_certs: "{{ awx_validate_certs }}"
+        return_content: false
+
+        status_code:
+          - 200
+          - 201
+
+      register: survey_update_result
+      no_log: true
+
+    - name: Enable the Survey on the target Job Template
+      ansible.builtin.uri:
+        url: >-
+          {{ awx_controller_url }}/api/v2/job_templates/{{ awx_target_job_template_id }}/
+        method: PATCH
+
+        headers:
+          Authorization: "{{ ['Bearer', awx_oauth_token] | join(' ') }}"
+          Accept: application/json
+          Content-Type: application/json
+
+        body_format: json
+
+        body:
+          survey_enabled: true
+
+        validate_certs: "{{ awx_validate_certs }}"
+        return_content: false
+        status_code: 200
+
+      register: survey_enable_result
+      no_log: true
+
+    - name: Retrieve the final target Job Template Survey
+      ansible.builtin.uri:
+        url: >-
+          {{ awx_controller_url }}/api/v2/job_templates/{{ awx_target_job_template_id }}/survey_spec/
+        method: GET
+
+        headers:
+          Authorization: "{{ ['Bearer', awx_oauth_token] | join(' ') }}"
+          Accept: application/json
+
+        validate_certs: "{{ awx_validate_certs }}"
+        return_content: true
+        status_code: 200
+
+      register: final_survey_result
+      changed_when: false
+      no_log: true
+
+    - name: Locate the final generated-target Survey question
+      ansible.builtin.set_fact:
+        final_target_questions: >-
+          {{
+            final_survey_result.json.spec
+            | default([])
+            | selectattr(
+                'variable',
+                'equalto',
+                target_survey_variable
+              )
+            | list
+          }}
+
+    - name: Require exactly one final generated-target Survey question
+      ansible.builtin.assert:
+        that:
+          - final_target_questions | length == 1
+          - final_target_questions[0].type == 'multiselect'
+          - final_target_questions[0].required | bool
+        fail_msg: >-
+          The target Job Template does not contain exactly one required
+          multiselect question using variable
+          {{ target_survey_variable }}.
+
+    - name: Normalize the final stored Survey choices
+      ansible.builtin.set_fact:
+        final_stored_choices: >-
+          {{
+            final_target_questions[0].choices.splitlines()
+            | map('trim')
+            | reject('equalto', '')
+            | list
+          }}
+
+    - name: Verify the forwarded target Job Template choices
+      ansible.builtin.assert:
+        that:
+          - final_stored_choices == generated_target_choices
+        fail_msg: |
+          The target Job Template stored choices do not match the generated
+          choices.
+
+          Generated:
+          {{ generated_target_choices | to_nice_yaml }}
+
+          Stored:
+          {{ final_stored_choices | to_nice_yaml }}
+        success_msg: >-
+          The target Job Template now contains all generated target choices.
+
+    - name: Display final summary
+      ansible.builtin.debug:
+        msg:
+          - >-
+            Selected MDS hosts:
+            {{ groups['selected_mds'] | sort | join(', ') }}
+          - >-
+            Published choice count:
+            {{ generated_target_choices | length }}
+          - "Target Job Template ID: {{ awx_target_job_template_id }}"
+          - "Target Survey variable: {{ target_survey_variable }}"
+          - "Cluster format: Cluster_Name | CMA_Name(CMA_IP) | MDS_Name"
+          - "Standalone format: gateway_name | CMA_Name(CMA_IP) | MDS_Name"
+          - "Cluster member names are not published."
