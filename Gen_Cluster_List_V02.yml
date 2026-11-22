@@ -2,7 +2,9 @@
 # Reads the AWX `target_cmas` multiselect, runs one login-shell command on
 # each selected MDS (all of that MDS's selected CMAs are processed inside
 # that one shell), and publishes the generated target choices to the
-# configured target Job Template without deleting its other Survey questions.
+# configured target Job Template. Existing static Survey questions are kept
+# unchanged and in their original order. The generated multiselect is always
+# appended after them.
 #
 # Expected target_cmas choice format:
 #   CMA1-SMS1(172.20.50.31) | MDS21
@@ -49,7 +51,8 @@
     # Change this value if a different target Job Template is required.
     awx_target_job_template_id: 33
 
-    # Survey question to create or replace on the target Job Template.
+    # Generated Survey question configuration.
+    # This variable uniquely identifies the generated question.
     target_survey_variable: selected_target_choices
     target_survey_question_name: "Select Cluster / Gateway"
 
@@ -545,12 +548,18 @@
       changed_when: false
       no_log: true
 
-    - name: Build the replacement target question and preserve other questions
+    # Every existing question whose variable is not target_survey_variable
+    # is treated as a static question. rejectattr preserves the relative
+    # order and full question dictionaries exactly as returned by AWX.
+    #
+    # Any previous generated question using target_survey_variable is removed.
+    # This also removes accidental duplicates from earlier runs.
+    - name: Preserve static Survey questions in their original order
       ansible.builtin.set_fact:
         forwarded_choices_text: >-
           {{ generated_target_choices | join('\n') }}
 
-        preserved_survey_questions: >-
+        preserved_static_survey_questions: >-
           {{
             current_survey_result.json.spec
             | default([])
@@ -562,9 +571,9 @@
             | list
           }}
 
-    - name: Define the target Job Template Survey question
+    - name: Define the generated cluster and gateway Survey question
       ansible.builtin.set_fact:
-        target_survey_question:
+        generated_target_survey_question:
           question_name: "{{ target_survey_question_name }}"
 
           question_description: >-
@@ -577,12 +586,17 @@
           choices: "{{ forwarded_choices_text }}"
           default: ""
 
-    - name: Build the complete target Job Template Survey specification
+    # Static questions remain first and unchanged. Exactly one generated
+    # question is appended as the final question.
+    - name: Append the generated question after all static questions
       ansible.builtin.set_fact:
         updated_survey_spec: >-
-          {{ [target_survey_question] + preserved_survey_questions }}
+          {{
+            preserved_static_survey_questions
+            + [generated_target_survey_question]
+          }}
 
-    - name: Update the target Job Template Survey choices
+    - name: Update the target Job Template Survey
       ansible.builtin.uri:
         url: >-
           {{ awx_controller_url }}/api/v2/job_templates/{{ awx_target_job_template_id }}/survey_spec/
@@ -596,6 +610,7 @@
         body_format: json
 
         body:
+          # Preserve the existing Survey name and description.
           name: >-
             {{
               current_survey_result.json.name
@@ -664,8 +679,14 @@
       changed_when: false
       no_log: true
 
-    - name: Locate the final generated-target Survey question
+    - name: Separate final static and generated Survey questions
       ansible.builtin.set_fact:
+        final_survey_questions: >-
+          {{
+            final_survey_result.json.spec
+            | default([])
+          }}
+
         final_target_questions: >-
           {{
             final_survey_result.json.spec
@@ -678,22 +699,54 @@
             | list
           }}
 
-    - name: Require exactly one final generated-target Survey question
+        final_static_survey_questions: >-
+          {{
+            final_survey_result.json.spec
+            | default([])
+            | rejectattr(
+                'variable',
+                'equalto',
+                target_survey_variable
+              )
+            | list
+          }}
+
+    - name: Verify static questions and generated-question placement
       ansible.builtin.assert:
         that:
+          # There must be only one generated question.
           - final_target_questions | length == 1
-          - final_target_questions[0].type == 'multiselect'
-          - final_target_questions[0].required | bool
-        fail_msg: >-
-          The target Job Template does not contain exactly one required
-          multiselect question using variable
-          {{ target_survey_variable }}.
 
-    - name: Normalize the final stored Survey choices
+          # The final Survey must contain all static questions plus one
+          # generated question.
+          - final_survey_questions | length == preserved_static_survey_questions | length + 1
+
+          # Static questions must be unchanged and remain in their original
+          # order.
+          - final_static_survey_questions == preserved_static_survey_questions
+          - final_survey_questions[:-1] == preserved_static_survey_questions
+
+          # The generated question must be the last question.
+          - final_survey_questions[-1].variable == target_survey_variable
+          - final_survey_questions[-1].type == 'multiselect'
+          - final_survey_questions[-1].required | bool
+
+        fail_msg: |
+          The final Survey structure is incorrect.
+
+          The existing static questions must remain unchanged and in their
+          original order. Exactly one generated question using variable
+          {{ target_survey_variable }} must be appended as the last question.
+
+        success_msg: >-
+          Static Survey questions were preserved unchanged and in their
+          original order, followed by exactly one generated question.
+
+    - name: Normalize the final stored generated choices
       ansible.builtin.set_fact:
         final_stored_choices: >-
           {{
-            final_target_questions[0].choices.splitlines()
+            final_survey_questions[-1].choices.splitlines()
             | map('trim')
             | reject('equalto', '')
             | list
@@ -712,6 +765,7 @@
 
           Stored:
           {{ final_stored_choices | to_nice_yaml }}
+
         success_msg: >-
           The target Job Template now contains all generated target choices.
 
@@ -721,11 +775,15 @@
           - >-
             Selected MDS hosts:
             {{ groups['selected_mds'] | sort | join(', ') }}
+
           - >-
             Published choice count:
             {{ generated_target_choices | length }}
+
           - "Target Job Template ID: {{ awx_target_job_template_id }}"
           - "Target Survey variable: {{ target_survey_variable }}"
           - "Cluster format: Cluster_Name | CMA_Name(CMA_IP) | MDS_Name"
           - "Standalone format: gateway_name | CMA_Name(CMA_IP) | MDS_Name"
+          - "Static Survey questions remain unchanged and first."
+          - "The generated question is unique and appended last."
           - "Cluster member names are not published."
