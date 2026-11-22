@@ -161,14 +161,12 @@
             dest: "{{ inventory_root }}/{{ report_only_change_id }}/cma_inventory.csv"
             mode: "0640"
             content: |
-              Creator: {{ requestor_name }}
-              Creation Time: {{ execution_timestamp }}
+              "Creator","{{ requestor_name | replace('"', '""') }}",""
+              "Creation Time","{{ execution_timestamp | replace('"', '""') }}",""
 
-              ==============================================================================
-              MDS Name                         CMA Name                         CMA IP
-              ==============================================================================
+              "MDS Name","CMA Name","CMA IP"
               {% for item in cma_list %}
-              {{ "%-32s %-32s %s" | format(item.mds, item.cma, item.ip) }}
+              "{{ item.mds | replace('"', '""') }}","{{ item.cma | replace('"', '""') }}","{{ item.ip | replace('"', '""') }}"
               {% endfor %}
 
         - name: Email CMA report
@@ -180,12 +178,12 @@
             subject: "{{ email_subject }}"
             body: "{{ email_content }}"
             attach:
-              - "{{ inventory_root }}/{{ report_only_change_id }}/cma_inventory"
+              - "{{ inventory_root }}/{{ report_only_change_id }}/cma_inventory.csv"
 
         - name: Show report result
           ansible.builtin.debug:
             msg:
-              - "Report: {{ inventory_root }}/{{ report_only_change_id }}/cma_inventory"
+              - "Report: {{ inventory_root }}/{{ report_only_change_id }}/cma_inventory.csv"
               - "Email sent to: {{ requestor_email }}"
 
     # ----------------------------------------------------------------
@@ -222,13 +220,17 @@
 
         - name: Create or overwrite structured CMA file
           ansible.builtin.copy:
-            dest: "{{ inventory_root }}/{{ change_id }}/{{ change_id }}_active_cma_list"
+            dest: "{{ inventory_root }}/{{ change_id }}/{{ change_id }}_active_cma_list.csv"
             mode: "0640"
-            content: "{{ cma_list | to_nice_json(indent=2) }}\n"
+            content: |
+              "mds","cma","ip"
+              {% for item in cma_list %}
+              "{{ item.mds | replace('"', '""') }}","{{ item.cma | replace('"', '""') }}","{{ item.ip | replace('"', '""') }}"
+              {% endfor %}
 
         - name: Read structured CMA file
           ansible.builtin.slurp:
-            src: "{{ inventory_root }}/{{ change_id }}/{{ change_id }}_active_cma_list"
+            src: "{{ inventory_root }}/{{ change_id }}/{{ change_id }}_active_cma_list.csv"
           register: structured_cma_file
 
         - name: Show structured CMA file in AWX output
@@ -315,6 +317,6 @@
         - name: Show survey update result
           ansible.builtin.debug:
             msg:
-              - "Structured file: {{ inventory_root }}/{{ change_id }}/{{ change_id }}_active_cma_list"
+              - "Structured file: {{ inventory_root }}/{{ change_id }}/{{ change_id }}_active_cma_list.csv"
               - "Updated next template ID: {{ next_template_id }}"
               - "CMA choices: {{ cma_choices.split('\n') }}"
