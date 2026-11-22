@@ -9,7 +9,6 @@
     # EASY-TO-CHANGE SETTINGS
     # ================================================================
     next_template_id: 30
-
     checkpoint_domain: "System Data"
 
     awx_host: "http://172.20.50.28:30080"
@@ -242,7 +241,7 @@
               item.cma
               ~ '('
               ~ item.ip
-              ~ ') == '
+              ~ ') | '
               ~ item.mds
             ]
           }}
