@@ -1,7 +1,3 @@
-domain_data: "{{ domain_stdout_safe }}"
-``` 【Download the complete corrected playbook-4e224d】
-
-```yaml
 ---
 - name: Collect active CMA inventory
   hosts: "{{ mds_host | default('MDS21', true) }}"
