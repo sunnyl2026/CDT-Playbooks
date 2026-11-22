@@ -60,11 +60,29 @@
           - json
       register: domain_result
       changed_when: false
+      failed_when: false
       no_log: true
+
+    - name: Sanitize Check Point command output
+      ansible.builtin.set_fact:
+        domain_stdout_safe: >-
+          {{ domain_result.stdout | default('') | replace(checkpoint_api_key, '********') }}
+        domain_stderr_safe: >-
+          {{ domain_result.stderr | default('') | replace(checkpoint_api_key, '********') }}
+      no_log: true
+
+    - name: Report Check Point command failure safely
+      ansible.builtin.fail:
+        msg: |-
+          mgmt_cli failed on {{ inventory_hostname }}.
+          Return code: {{ domain_result.rc | default('unknown') }}
+          Standard error: {{ domain_stderr_safe | default('(empty)', true) }}
+          Standard output: {{ domain_stdout_safe | default('(empty)', true) }}
+      when: domain_result.rc | default(1) | int != 0
 
     - name: Initialize CMA data
       ansible.builtin.set_fact:
-        domain_data: "{{ domain_result.stdout | from_json }}"
+        domain_data: "{{ domain_stdout_safe | from_json }}"
         cma_list: []
 
     - name: Build active CMA list
