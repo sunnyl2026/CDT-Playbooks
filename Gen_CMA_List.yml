@@ -1,758 +1,318 @@
 ---
-- name: Generate MDS CMA inventory and refresh AWX CMA survey
-  hosts: all
+- name: Collect active CMA inventory
+  hosts: "{{ mds_host | default('MDS21', true) }}"
   gather_facts: false
+  become: false
 
   vars:
-    # =========================================================
-    # MDS configuration
-    # =========================================================
+    # ================================================================
+    # EASY-TO-CHANGE SETTINGS
+    # ================================================================
+    smtp_server: "172.20.50.29"
+    smtp_from: "donotreply@hkps.cp"
+    email_subject: "DoNotReply: Active CMA List Requested by {{ requestor_name }}"
+    email_content: |-
+      This is a system generated email from MDS Host MDS21
+      {{ execution_timestamp }}
 
-    ansible_python_interpreter: /usr/bin/python3
+      CMA list as attached
 
-    inventory_directory: /var/log/CDT_Project/Inventory
-    inventory_file: /var/log/CDT_Project/Inventory/mds_inventory
+    next_template_id: 30
 
-    # =========================================================
-    # AWX configuration
-    # =========================================================
+    # CHECKPOINT_API_KEY and AWX_OAUTH_TOKEN are supplied by custom credentials
+    # attached to this AWX job template. Neither secret is hard-coded here.
+    checkpoint_api_key: "{{ lookup('ansible.builtin.env', 'CHECKPOINT_API_KEY') }}"
+    awx_host: "http://172.20.50.28:30080"
 
-    # Confirmed from:
-    # kubectl get svc -n awx
-    #
-    # awx-service:
-    # NodePort 80:30080/TCP
-    awx_controller_url: "http://172.20.50.28:30080"
-
-    # Target Job Template that receives the CMA survey.
-    target_job_template_id: 13
-
-    # Injected by the custom AWX API Token credential.
-    awx_oauth_token: >-
-      {{
-        lookup('ansible.builtin.env', 'AWX_OAUTH_TOKEN')
-        | default('', true)
-        | trim
-      }}
-
-    # HTTP is currently used, so certificate validation has no effect.
-    # Keep false if HTTPS with a self-signed certificate is used later.
-    awx_validate_certs: false
+    # Portability settings
+    checkpoint_domain: "System Data"
+    inventory_root: "/var/log/CDT_Project/Inventory"
+    report_only_change_id: "CMA_Report_ONLY"
+    awx_validate_certs: true
 
   tasks:
+    - name: Validate required input
+      ansible.builtin.assert:
+        that:
+          - change_id is defined
+          - change_id | trim | length > 0
+          - change_id is match('^[A-Za-z0-9][A-Za-z0-9._-]*$')
+          - change_id not in ['.', '..']
+        fail_msg: >-
+          A valid change_id and checkpoint_api_key are required. change_id may
+          contain only letters, numbers, dots, underscores, and hyphens.
+      no_log: true
 
-    # =========================================================
-    # 1. Run mdsstat
-    # =========================================================
-
-    - name: Run mdsstat
+    - name: Collect domain information from Check Point
       ansible.builtin.shell: |
-        source /etc/profile.d/CP.sh
-        mdsstat
+        set +x
+
+        if [ -z "${CHECKPOINT_API_KEY:-}" ]; then
+          echo "CHECKPOINT_DIAG: EMPTY_CREDENTIAL" >&2
+          exit 91
+        fi
+
+        mgmt_cli_path="/opt/CPshrd-R82/bin/mgmt_cli"
+        if [ ! -x "$mgmt_cli_path" ]; then
+          echo "CHECKPOINT_DIAG: MGMT_CLI_NOT_FOUND: $mgmt_cli_path" >&2
+          exit 92
+        fi
+
+        "$mgmt_cli_path" \
+          --api-key "$CHECKPOINT_API_KEY" \
+          --domain "{{ checkpoint_domain }}" \
+          show domains \
+          details-level full \
+          --format json
       args:
         executable: /bin/bash
-      register: mdsstat_output
+      environment:
+        CHECKPOINT_API_KEY: "{{ checkpoint_api_key }}"
+        FWDIR: "/opt/CPmds-R82"
+        CPDIR: "/opt/CPshrd-R82"
+        MDSDIR: "/opt/CPmds-R82"
+        PATH: "/opt/CPshrd-R82/bin:/opt/CPmds-R82/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      register: domain_result
       changed_when: false
-      failed_when: mdsstat_output.rc != 0
+      failed_when: false
+      no_log: true
 
-
-    # =========================================================
-    # 2. Display raw mdsstat output
-    # =========================================================
-
-    - name: Display mdsstat output
-      ansible.builtin.debug:
-        var: mdsstat_output.stdout_lines
-
-
-    # =========================================================
-    # 3. Initialize structured CMA inventory
-    #
-    # Expected result:
-    #
-    # cma_inventory:
-    #   - name: CMA1_Pri_SMS
-    #     ip: 172.20.50.31
-    #   - name: CMA2_SMS1
-    #     ip: 172.20.50.41
-    # =========================================================
-
-    - name: Initialize structured CMA inventory
+    - name: Sanitize Check Point command output
       ansible.builtin.set_fact:
-        cma_inventory: []
+        domain_stdout_safe: >-
+          {{ (domain_result.stdout | default('') | replace(checkpoint_api_key, '********'))
+             if checkpoint_api_key | length > 0
+             else (domain_result.stdout | default('')) }}
+        domain_stderr_safe: >-
+          {{ (domain_result.stderr | default('') | replace(checkpoint_api_key, '********'))
+             if checkpoint_api_key | length > 0
+             else (domain_result.stderr | default('')) }}
+      no_log: true
 
+    - name: Report Check Point command failure safely
+      ansible.builtin.fail:
+        msg: |-
+          mgmt_cli failed on {{ inventory_hostname }}.
+          Return code: {{ domain_result.rc | default('unknown') }}
+          Diagnosis: {% if domain_result.rc | default(1) | int == 91 %}CHECKPOINT_API_KEY is empty; verify the custom AWX credential is attached and injects this environment variable.{% elif domain_result.rc | default(1) | int == 92 %}mgmt_cli was not found or is not executable at /opt/CPshrd-R82/bin/mgmt_cli.{% else %}mgmt_cli executed but returned a failure; review the sanitized output below.{% endif %}
+          Standard error: {{ domain_stderr_safe | default('(empty)', true) }}
+          Standard output: {{ domain_stdout_safe | default('(empty)', true) }}
+      when: domain_result.rc | default(1) | int != 0
 
-    # =========================================================
-    # 4. Parse CMA rows from mdsstat
-    #
-    # Source:
-    #
-    # | CMA | CMA1_Pri_SMS | 172.20.50.31 | up ... |
-    #
-    # split('|'):
-    #
-    # index 1 = CMA
-    # index 2 = CMA1_Pri_SMS
-    # index 3 = 172.20.50.31
-    # =========================================================
-
-    - name: Build structured CMA inventory
+    - name: Initialize CMA data
       ansible.builtin.set_fact:
-        cma_inventory: >-
-          {{
-            cma_inventory
-            +
-            [
-              {
-                'name': item.split('|')[2] | trim,
-                'ip': item.split('|')[3] | trim
-              }
-            ]
-          }}
-      loop: "{{ mdsstat_output.stdout_lines }}"
+        domain_data: "{{ domain_stdout_safe }}"
+        cma_list: []
+
+    - name: Build active CMA list
+      ansible.builtin.set_fact:
+        cma_list: >-
+          {{ cma_list + [{
+            'mds': item.1['multi-domain-server'],
+            'cma': item.1.name,
+            'ip': item.1['ipv4-address']
+          }] }}
+      loop: "{{ domain_data.objects | default([]) | subelements('servers', skip_missing=True) }}"
+      when: item.1.active | default(false) | bool
       loop_control:
-        label: "{{ item }}"
-      when:
-        - item.split('|') | length >= 4
-        - item.split('|')[1] | trim == 'CMA'
-        - item.split('|')[2] | trim | length > 0
-        - item.split('|')[3] | trim | length > 0
+        label: "{{ item.1.name | default('unknown CMA') }}"
 
-
-    # =========================================================
-    # 5. Confirm at least one CMA was found
-    # =========================================================
-
-    - name: Verify CMA entries were discovered
-      ansible.builtin.assert:
-        that:
-          - cma_inventory | length > 0
-        fail_msg: >-
-          No CMA entries were extracted from mdsstat.
-          Expected rows beginning with "| CMA |".
-        success_msg: >-
-          Found {{ cma_inventory | length }} CMA entries.
-
-
-    # =========================================================
-    # 6. Validate every CMA entry
-    # =========================================================
-
-    - name: Validate each CMA entry
-      ansible.builtin.assert:
-        that:
-          - item.name is defined
-          - item.ip is defined
-          - item.name | trim | length > 0
-          - item.ip is match('^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
-        fail_msg: "Invalid CMA entry: {{ item }}"
-        quiet: true
-      loop: "{{ cma_inventory }}"
-      loop_control:
-        label: "{{ item.name | default('unknown CMA') }}"
-
-
-    # =========================================================
-    # 7. Display structured inventory
-    # =========================================================
-
-    - name: Display structured CMA inventory
-      ansible.builtin.debug:
-        var: cma_inventory
-
-
-    # =========================================================
-    # 8. Initialize text lines for mds_inventory
-    # =========================================================
-
-    - name: Initialize MDS inventory file lines
+    - name: Sort and validate CMA list
       ansible.builtin.set_fact:
-        mds_inventory_lines: []
+        cma_list: "{{ cma_list | sort(attribute='cma') | sort(attribute='mds') }}"
 
-
-    # =========================================================
-    # 9. Build text inventory lines
-    #
-    # Result:
-    #
-    # CMA1_Pri_SMS 172.20.50.31
-    # CMA2_SMS1 172.20.50.41
-    # =========================================================
-
-    - name: Build MDS inventory file lines
-      ansible.builtin.set_fact:
-        mds_inventory_lines: >-
-          {{
-            mds_inventory_lines
-            +
-            [
-              item.name ~ ' ' ~ item.ip
-            ]
-          }}
-      loop: "{{ cma_inventory }}"
-      loop_control:
-        label: "{{ item.name }}"
-
-
-    # =========================================================
-    # 10. Ensure the parent directory exists
-    # =========================================================
-
-    - name: Ensure CDT Inventory directory exists
-      ansible.builtin.file:
-        path: "{{ inventory_directory }}"
-        state: directory
-        mode: "0755"
-
-
-    # =========================================================
-    # 11. Check the existing mds_inventory path
-    # =========================================================
-
-    - name: Check existing mds_inventory path
-      ansible.builtin.stat:
-        path: "{{ inventory_file }}"
-      register: existing_inventory_path
-
-
-    # =========================================================
-    # 12. Remove the old incorrect directory
-    #
-    # This removes:
-    #
-    # /var/log/CDT_Project/Inventory/mds_inventory/
-    #
-    # only if mds_inventory is currently a directory.
-    # =========================================================
-
-    - name: Remove old incorrect mds_inventory directory
-      ansible.builtin.file:
-        path: "{{ inventory_file }}"
-        state: absent
-      when:
-        - existing_inventory_path.stat.exists | default(false)
-        - existing_inventory_path.stat.isdir | default(false)
-
-
-    # =========================================================
-    # 13. Write the MDS inventory file
-    # =========================================================
-
-    - name: Write MDS CMA inventory file
-      ansible.builtin.copy:
-        content: "{{ mds_inventory_lines | join('\n') ~ '\n' }}"
-        dest: "{{ inventory_file }}"
-        mode: "0644"
-        force: true
-      register: inventory_write_result
-
-
-    # =========================================================
-    # 14. Check the generated file
-    # =========================================================
-
-    - name: Check generated inventory file
-      ansible.builtin.stat:
-        path: "{{ inventory_file }}"
-      register: generated_inventory_stat
-
-
-    # =========================================================
-    # 15. Ensure mds_inventory is a regular file
-    # =========================================================
-
-    - name: Verify generated inventory is a regular file
+    - name: Stop when no active CMA is found
       ansible.builtin.assert:
-        that:
-          - generated_inventory_stat.stat.exists | default(false)
-          - generated_inventory_stat.stat.isreg | default(false)
-          - not generated_inventory_stat.stat.isdir | default(false)
-        fail_msg: >-
-          {{ inventory_file }} was not created as a regular file.
-        success_msg: >-
-          {{ inventory_file }} was created successfully.
+        that: cma_list | length > 0
+        fail_msg: "No active CMA was returned by the Check Point API."
 
-
-    # =========================================================
-    # 16. Read the generated file
-    # =========================================================
-
-    - name: Read generated MDS inventory file
-      ansible.builtin.slurp:
-        src: "{{ inventory_file }}"
-      register: generated_inventory_raw
-
-
-    # =========================================================
-    # 17. Decode the generated file
-    # =========================================================
-
-    - name: Decode generated MDS inventory
-      ansible.builtin.set_fact:
-        generated_inventory_content: >-
-          {{
-            generated_inventory_raw.content
-            | b64decode
-            | trim
-          }}
-
-
-    # =========================================================
-    # 18. Verify generated file content
-    # =========================================================
-
-    - name: Verify generated inventory content
-      ansible.builtin.assert:
-        that:
-          - generated_inventory_content == (mds_inventory_lines | join('\n'))
-        fail_msg: |
-          Generated inventory file does not match the CMA data.
-
-          Expected:
-          {{ mds_inventory_lines | join('\n') }}
-
-          Actual:
-          {{ generated_inventory_content }}
-        success_msg: >-
-          Generated MDS inventory content is correct.
-
-
-    # =========================================================
-    # 19. Build sorted, unique Survey choices
-    #
-    # Only CMA names appear in the dropdown.
-    # =========================================================
-
-    - name: Build sorted CMA Survey choices
-      ansible.builtin.set_fact:
-        cma_survey_names: >-
-          {{
-            cma_inventory
-            | map(attribute='name')
-            | unique
-            | sort
-            | list
-          }}
-
-
-    # =========================================================
-    # 20. Display Survey choices
-    # =========================================================
-
-    - name: Display CMA Survey choices
-      ansible.builtin.debug:
-        msg:
-          - "Target Job Template ID: {{ target_job_template_id }}"
-          - "CMA choices: {{ cma_survey_names }}"
-
-
-    # =========================================================
-    # 21. Display safe API configuration
-    #
-    # The OAuth token value is never displayed.
-    # =========================================================
-
-    - name: Display safe AWX API configuration status
-      ansible.builtin.debug:
-        msg:
-          - "AWX Controller URL: {{ awx_controller_url }}"
-          - "Target Job Template ID: {{ target_job_template_id }}"
-          - "OAuth token injected: {{ (awx_oauth_token | length > 0) | bool }}"
-          - "TLS validation enabled: {{ awx_validate_certs }}"
-
-
-    # =========================================================
-    # 22. Validate AWX API configuration
-    # =========================================================
-
-    - name: Validate AWX API configuration
-      ansible.builtin.assert:
-        that:
-          - awx_controller_url | trim | length > 0
-          - not awx_controller_url.endswith('/')
-          - target_job_template_id | int == 13
-          - awx_oauth_token | length > 0
-          - cma_survey_names | length > 0
-        fail_msg: >-
-          AWX API configuration is incomplete. Verify the AWX
-          controller URL, Job Template ID 11, and the attached
-          AWX API Token credential.
-        success_msg: >-
-          AWX API configuration validated successfully.
-
-
-    # =========================================================
-    # 23. Test the confirmed AWX API root
-    #
-    # This request contains no token.
-    # =========================================================
-
-    - name: Test AWX API root
-      ansible.builtin.uri:
-        url: "{{ awx_controller_url }}/api/v2/"
-        method: GET
-        validate_certs: "{{ awx_validate_certs }}"
-        follow_redirects: safe
-        return_content: false
-        status_code:
-          - 200
-          - 301
-          - 302
-          - 404
-      delegate_to: localhost
-      run_once: true
-      register: awx_api_root_test
+    - name: Get creation timestamp from MDS host
+      ansible.builtin.command: date "+%Y-%m-%d %H:%M:%S %Z"
+      register: timestamp_result
       changed_when: false
 
+    - name: Save creation timestamp
+      ansible.builtin.set_fact:
+        execution_timestamp: "{{ timestamp_result.stdout }}"
 
-    # =========================================================
-    # 24. Display API-root result
-    # =========================================================
+    # ----------------------------------------------------------------
+    # TASK 1: report-only request
+    # ----------------------------------------------------------------
+    - name: Create and email the report-only inventory
+      when: change_id == report_only_change_id
+      block:
+        - name: Validate report requestor details
+          ansible.builtin.assert:
+            that:
+              - requestor_name is defined
+              - requestor_name | trim | length > 0
+              - requestor_email is defined
+              - requestor_email is match('^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$')
+            fail_msg: "requestor_name and a valid requestor_email are required."
 
-    - name: Display AWX API root result
-      ansible.builtin.debug:
-        msg:
-          - "Requested URL: {{ awx_controller_url }}/api/v2/"
-          - "HTTP status: {{ awx_api_root_test.status }}"
-          - "Content type: {{ awx_api_root_test.content_type | default('unknown') }}"
-          - >-
-            Result: {{
-              'AWX API root found'
-              if awx_api_root_test.status | int == 200
-              else
-              'AWX API root was not found'
-            }}
+        - name: Create report-only directory
+          ansible.builtin.file:
+            path: "{{ inventory_root }}/{{ report_only_change_id }}"
+            state: directory
+            mode: "0750"
 
+        - name: Create or overwrite CMA report
+          ansible.builtin.copy:
+            dest: "{{ inventory_root }}/{{ report_only_change_id }}/cma_inventory.log"
+            mode: "0640"
+            content: |
+              Creator: {{ requestor_name }}
+              Creation Time: {{ execution_timestamp }}
 
-    # =========================================================
-    # 25. Verify the API root is valid
-    # =========================================================
+              ==============================================================================
+              MDS Name                         CMA Name                         CMA IP
+              ==============================================================================
+              {% for item in cma_list %}
+              {{ "%-32s %-32s %s" | format(item.mds, item.cma, item.ip) }}
+              {% endfor %}
 
-    - name: Verify AWX API root was found
-      ansible.builtin.assert:
-        that:
-          - awx_api_root_test.status | int == 200
-        fail_msg: |
-          The AWX API was not found at:
+        - name: Email CMA report
+          community.general.mail:
+            host: "{{ smtp_server }}"
+            port: 25
+            from: "{{ smtp_from }}"
+            to: "{{ requestor_email }}"
+            subject: "{{ email_subject }}"
+            body: "{{ email_content }}"
+            attach:
+              - "{{ inventory_root }}/{{ report_only_change_id }}/cma_inventory.log"
 
-          {{ awx_controller_url }}/api/v2/
+        - name: Show report result
+          ansible.builtin.debug:
+            msg:
+              - "Report: {{ inventory_root }}/{{ report_only_change_id }}/cma_inventory.log"
+              - "Email sent to: {{ requestor_email }}"
 
-          HTTP status: {{ awx_api_root_test.status }}
+    # ----------------------------------------------------------------
+    # TASK 2: change-specific inventory and next-template survey
+    # ----------------------------------------------------------------
+    - name: Create change inventory and update the next template survey
+      when: change_id != report_only_change_id
+      block:
+        - name: Validate AWX API settings and injected token
+          ansible.builtin.assert:
+            that:
+              - awx_host | trim | length > 0
+              - lookup('ansible.builtin.env', 'AWX_OAUTH_TOKEN') | default('', true) | trim | length > 0
+              - next_template_id | int > 0
+            fail_msg: >-
+              awx_host, an AWX_OAUTH_TOKEN credential, and a positive
+              next_template_id are required for Task 2.
+          no_log: true
 
-          The expected controller URL is:
+        - name: Build AWX API headers from the attached credential
+          ansible.builtin.set_fact:
+            awx_api_headers:
+              Authorization: "Bearer {{ lookup('ansible.builtin.env', 'AWX_OAUTH_TOKEN') | default('', true) | trim }}"
+              Accept: "application/json"
+          no_log: true
 
-          http://172.20.50.28:30080
-        success_msg: >-
-          AWX API root is reachable.
+        - name: Create change directory
+          ansible.builtin.file:
+            path: "{{ inventory_root }}/{{ change_id }}"
+            state: directory
+            mode: "0750"
 
+        - name: Create or overwrite structured CMA file
+          ansible.builtin.copy:
+            dest: "{{ inventory_root }}/{{ change_id }}/{{ change_id }}_active_cma_list.csv"
+            mode: "0640"
+            content: "{{ cma_list | to_nice_json(indent=2) }}\n"
 
-    # =========================================================
-    # 26. Check authenticated access to Job Template 11
-    #
-    # no_log protects the Authorization header.
-    #
-    # Common HTTP statuses are accepted so the following tasks
-    # can display a sanitized result.
-    # =========================================================
+        - name: Read structured CMA file
+          ansible.builtin.slurp:
+            src: "{{ inventory_root }}/{{ change_id }}/{{ change_id }}_active_cma_list.csv"
+          register: structured_cma_file
 
-    - name: Check authenticated access to Job Template 11
-      ansible.builtin.uri:
-        url: >-
-          {{ awx_controller_url }}/api/v2/job_templates/{{ target_job_template_id }}/
-        method: GET
-        headers:
-          Authorization: "Bearer {{ awx_oauth_token }}"
-          Accept: "application/json"
-        validate_certs: "{{ awx_validate_certs }}"
-        follow_redirects: safe
-        return_content: false
-        status_code:
-          - 200
-          - 401
-          - 403
-          - 404
-      delegate_to: localhost
-      run_once: true
-      register: target_job_template_test
-      changed_when: false
-      no_log: true
+        - name: Show structured CMA file in AWX output
+          ansible.builtin.debug:
+            msg: "{{ structured_cma_file.content | b64decode }}"
 
+        - name: Read existing survey from next template
+          ansible.builtin.uri:
+            url: "{{ awx_host | regex_replace('/+$', '') }}/api/v2/job_templates/{{ next_template_id }}/survey_spec/"
+            method: GET
+            headers: "{{ awx_api_headers }}"
+            validate_certs: "{{ awx_validate_certs }}"
+            return_content: true
+            status_code: 200
+          register: existing_survey
+          delegate_to: localhost
+          become: false
+          no_log: true
 
-    # =========================================================
-    # 27. Display sanitized authentication result
-    # =========================================================
+        - name: Preserve existing survey questions
+          ansible.builtin.set_fact:
+            existing_questions: >-
+              {{ existing_survey.json.spec | default([])
+                 | rejectattr('variable', 'equalto', 'change_id')
+                 | rejectattr('variable', 'equalto', 'target_cmas')
+                 | list }}
+            cma_choices: "{{ cma_list | map(attribute='cma') | unique | sort | join('\n') }}"
 
-    - name: Display authenticated Job Template API status
-      ansible.builtin.debug:
-        msg:
-          - "Job Template API status: {{ target_job_template_test.status }}"
-          - "Requested Job Template ID: {{ target_job_template_id }}"
-          - >-
-            Result: {{
-              'Authenticated access succeeded'
-              if target_job_template_test.status | int == 200
-              else
-              'Authenticated access failed'
-            }}
+        - name: Build updated survey
+          ansible.builtin.set_fact:
+            updated_questions: >-
+              {{ existing_questions + [
+                {
+                  'question_name': 'Please Enter Your Change ID',
+                  'question_description': '',
+                  'required': true,
+                  'type': 'text',
+                  'variable': 'change_id',
+                  'default': change_id,
+                  'min': 1,
+                  'max': 128
+                },
+                {
+                  'question_name': 'Please Select Your Target CMA',
+                  'question_description': '',
+                  'required': true,
+                  'type': 'multiselect',
+                  'variable': 'target_cmas',
+                  'choices': cma_choices,
+                  'default': ''
+                }
+              ] }}
 
+        - name: Update next template survey
+          ansible.builtin.uri:
+            url: "{{ awx_host | regex_replace('/+$', '') }}/api/v2/job_templates/{{ next_template_id }}/survey_spec/"
+            method: POST
+            headers: "{{ awx_api_headers }}"
+            body_format: json
+            body:
+              name: "{{ existing_survey.json.name | default('') }}"
+              description: "{{ existing_survey.json.description | default('') }}"
+              spec: "{{ updated_questions }}"
+            validate_certs: "{{ awx_validate_certs }}"
+            status_code: [200, 201]
+          delegate_to: localhost
+          become: false
+          no_log: true
 
-    # =========================================================
-    # 28. Verify authenticated access
-    # =========================================================
+        - name: Enable survey on next template
+          ansible.builtin.uri:
+            url: "{{ awx_host | regex_replace('/+$', '') }}/api/v2/job_templates/{{ next_template_id }}/"
+            method: PATCH
+            headers: "{{ awx_api_headers }}"
+            body_format: json
+            body:
+              survey_enabled: true
+            validate_certs: "{{ awx_validate_certs }}"
+            status_code: 200
+          delegate_to: localhost
+          become: false
+          no_log: true
 
-    - name: Verify authenticated access to Job Template 11
-      ansible.builtin.assert:
-        that:
-          - target_job_template_test.status | int == 200
-        fail_msg: |
-          Unable to access AWX Job Template 11.
-
-          HTTP status: {{ target_job_template_test.status }}
-
-          401 = OAuth token is invalid or expired.
-          403 = Token owner lacks permission.
-          404 = Job Template ID 11 does not exist or is not visible.
-        success_msg: >-
-          Authenticated access to Job Template 11 succeeded.
-
-
-    # =========================================================
-    # 29. Create or replace the Survey on Job Template 11
-    #
-    # multiplechoice provides a single-selection choice.
-    #
-    # Job Template 11 receives:
-    #
-    # selected_cma_name: CMA1_Pri_SMS
-    # =========================================================
-
-    - name: Update CMA Survey on Job Template 11
-      ansible.builtin.uri:
-        url: >-
-          {{ awx_controller_url }}/api/v2/job_templates/{{ target_job_template_id }}/survey_spec/
-        method: POST
-        headers:
-          Authorization: "Bearer {{ awx_oauth_token }}"
-          Accept: "application/json"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          name: "CMA Selection"
-          description: >-
-            Select one CMA from the current MDS inventory.
-          spec:
-            - question_name: "Select CMA"
-              question_description: >-
-                Select the CMA to use for the CDT operation.
-              required: true
-              type: "multiplechoice"
-              variable: "selected_cma_name"
-              choices: "{{ cma_survey_names }}"
-              default: "{{ cma_survey_names | first }}"
-        validate_certs: "{{ awx_validate_certs }}"
-        follow_redirects: safe
-        return_content: false
-        status_code:
-          - 200
-          - 201
-          - 400
-          - 401
-          - 403
-          - 404
-      delegate_to: localhost
-      run_once: true
-      register: survey_update_result
-      no_log: true
-
-
-    # =========================================================
-    # 30. Display sanitized Survey-update result
-    # =========================================================
-
-    - name: Display CMA Survey update status
-      ansible.builtin.debug:
-        msg:
-          - "Survey update HTTP status: {{ survey_update_result.status }}"
-          - "Target Job Template ID: {{ target_job_template_id }}"
-
-
-    # =========================================================
-    # 31. Verify Survey update
-    # =========================================================
-
-    - name: Verify CMA Survey update succeeded
-      ansible.builtin.assert:
-        that:
-          - survey_update_result.status | int in [200, 201]
-        fail_msg: |
-          Updating the CMA Survey failed.
-
-          HTTP status: {{ survey_update_result.status }}
-
-          400 = Survey specification is invalid.
-          401 = OAuth token is invalid or expired.
-          403 = Token owner lacks permission.
-          404 = Job Template or Survey endpoint was not found.
-        success_msg: >-
-          CMA Survey was updated successfully on Job Template 11.
-
-
-    # =========================================================
-    # 32. Enable the Survey on Job Template 11
-    # =========================================================
-
-    - name: Enable Survey on Job Template 11
-      ansible.builtin.uri:
-        url: >-
-          {{ awx_controller_url }}/api/v2/job_templates/{{ target_job_template_id }}/
-        method: PATCH
-        headers:
-          Authorization: "Bearer {{ awx_oauth_token }}"
-          Accept: "application/json"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          survey_enabled: true
-        validate_certs: "{{ awx_validate_certs }}"
-        follow_redirects: safe
-        return_content: false
-        status_code:
-          - 200
-          - 400
-          - 401
-          - 403
-          - 404
-      delegate_to: localhost
-      run_once: true
-      register: survey_enable_result
-      no_log: true
-
-
-    # =========================================================
-    # 33. Display sanitized Survey-enable result
-    # =========================================================
-
-    - name: Display Survey enable status
-      ansible.builtin.debug:
-        msg:
-          - "Survey enable HTTP status: {{ survey_enable_result.status }}"
-          - "Target Job Template ID: {{ target_job_template_id }}"
-
-
-    # =========================================================
-    # 34. Verify Survey was enabled
-    # =========================================================
-
-    - name: Verify Survey was enabled
-      ansible.builtin.assert:
-        that:
-          - survey_enable_result.status | int == 200
-        fail_msg: >-
-          Enabling the Survey on Job Template 11 failed with
-          HTTP status {{ survey_enable_result.status }}.
-        success_msg: >-
-          Survey was enabled successfully on Job Template 11.
-
-
-    # =========================================================
-    # 35. Retrieve final Survey specification
-    # =========================================================
-
-    - name: Retrieve final Survey specification
-      ansible.builtin.uri:
-        url: >-
-          {{ awx_controller_url }}/api/v2/job_templates/{{ target_job_template_id }}/survey_spec/
-        method: GET
-        headers:
-          Authorization: "Bearer {{ awx_oauth_token }}"
-          Accept: "application/json"
-        validate_certs: "{{ awx_validate_certs }}"
-        follow_redirects: safe
-        return_content: true
-        status_code:
-          - 200
-          - 401
-          - 403
-          - 404
-      delegate_to: localhost
-      run_once: true
-      register: final_survey_spec
-      changed_when: false
-      no_log: true
-
-
-    # =========================================================
-    # 36. Verify final Survey is accessible
-    # =========================================================
-
-    - name: Verify final Survey specification is accessible
-      ansible.builtin.assert:
-        that:
-          - final_survey_spec.status | int == 200
-        fail_msg: >-
-          The Survey update completed, but Survey verification
-          failed with HTTP status {{ final_survey_spec.status }}.
-        success_msg: >-
-          Final Survey specification is accessible.
-
-
-    # =========================================================
-    # 37. Verify the final Survey question
-    # =========================================================
-
-    - name: Verify final CMA Survey content
-      ansible.builtin.assert:
-        that:
-          - final_survey_spec.json is defined
-          - final_survey_spec.json.spec is defined
-          - final_survey_spec.json.spec | length > 0
-          - final_survey_spec.json.spec[0].variable == 'selected_cma_name'
-          - final_survey_spec.json.spec[0].type == 'multiplechoice'
-          - final_survey_spec.json.spec[0].required | bool
-        fail_msg: >-
-          The final Survey does not contain the expected required
-          selected_cma_name multiple-choice question.
-        success_msg: >-
-          The final CMA Survey content is correct.
-
-
-    # =========================================================
-    # 38. Publish the structured CMA artifact
-    #
-    # Result:
-    #
-    # {
-    #   "cma_inventory": [
-    #     {
-    #       "name": "CMA1_Pri_SMS",
-    #       "ip": "172.20.50.31"
-    #     },
-    #     {
-    #       "name": "CMA2_SMS1",
-    #       "ip": "172.20.50.41"
-    #     }
-    #   ]
-    # }
-    # =========================================================
-
-    - name: Publish structured CMA inventory artifact
-      ansible.builtin.set_stats:
-        data:
-          cma_inventory: "{{ cma_inventory }}"
-        per_host: false
-
-
-    # =========================================================
-    # 39. Display final result
-    # =========================================================
-
-    - name: Display final result
-      ansible.builtin.debug:
-        msg:
-          - "MDS CMA inventory generated successfully."
-          - "Inventory file: {{ inventory_file }}"
-          - "CMA count: {{ cma_inventory | length }}"
-          - "CMA inventory: {{ cma_inventory }}"
-          - "Job Template {{ target_job_template_id }} Survey refreshed."
-          - "Survey variable: selected_cma_name"
-          - "Survey choices: {{ cma_survey_names }}"
+        - name: Show survey update result
+          ansible.builtin.debug:
+            msg:
+              - "Structured file: {{ inventory_root }}/{{ change_id }}/{{ change_id }}_active_cma_list.csv"
+              - "Updated next template ID: {{ next_template_id }}"
+              - "CMA choices: {{ cma_choices.split('\n') }}"
