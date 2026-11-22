@@ -1,3 +1,7 @@
+domain_data: "{{ domain_stdout_safe }}"
+``` 【Download the complete corrected playbook-4e224d】
+
+```yaml
 ---
 - name: Collect active CMA inventory
   hosts: "{{ mds_host | default('MDS21', true) }}"
@@ -101,7 +105,7 @@
 
     - name: Initialize CMA data
       ansible.builtin.set_fact:
-        domain_data: "{{ domain_stdout_safe | from_json }}"
+        domain_data: "{{ domain_stdout_safe }}"
         cma_list: []
 
     - name: Build active CMA list
