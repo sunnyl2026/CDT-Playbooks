@@ -38,26 +38,58 @@
           - change_id | trim | length > 0
           - change_id is match('^[A-Za-z0-9][A-Za-z0-9._-]*$')
           - change_id not in ['.', '..']
-          - checkpoint_api_key | length > 0
         fail_msg: >-
           A valid change_id and checkpoint_api_key are required. change_id may
           contain only letters, numbers, dots, underscores, and hyphens.
       no_log: true
 
     - name: Collect domain information from Check Point
-      ansible.builtin.command:
-        argv:
-          - mgmt_cli
-          - --api-key
-          - "{{ checkpoint_api_key }}"
-          - --domain
-          - "{{ checkpoint_domain }}"
-          - show
-          - domains
-          - details-level
-          - full
-          - --format
-          - json
+      ansible.builtin.shell: |
+        set +x
+
+        if [ -z "${CHECKPOINT_API_KEY:-}" ]; then
+          echo "CHECKPOINT_DIAG: EMPTY_CREDENTIAL" >&2
+          exit 91
+        fi
+
+        checkpoint_profile=""
+        for profile in /etc/profile.d/CP.sh /etc/profile; do
+          if [ -r "$profile" ]; then
+            checkpoint_profile="$profile"
+            break
+          fi
+        done
+
+        if [ -z "$checkpoint_profile" ]; then
+          echo "CHECKPOINT_DIAG: PROFILE_NOT_FOUND" >&2
+          exit 90
+        fi
+
+        if ! source "$checkpoint_profile" 1>&2; then
+          echo "CHECKPOINT_DIAG: PROFILE_LOAD_FAILED: $checkpoint_profile" >&2
+          exit 93
+        fi
+
+        mgmt_cli_path="$(command -v mgmt_cli 2>/dev/null || true)"
+        if [ -z "$mgmt_cli_path" ] && [ -n "${FWDIR:-}" ] && [ -x "$FWDIR/bin/mgmt_cli" ]; then
+          mgmt_cli_path="$FWDIR/bin/mgmt_cli"
+        fi
+
+        if [ -z "$mgmt_cli_path" ]; then
+          echo "CHECKPOINT_DIAG: MGMT_CLI_NOT_FOUND after loading $checkpoint_profile" >&2
+          exit 92
+        fi
+
+        "$mgmt_cli_path" \
+          --api-key "$CHECKPOINT_API_KEY" \
+          --domain "{{ checkpoint_domain }}" \
+          show domains \
+          details-level full \
+          --format json
+      args:
+        executable: /bin/bash
+      environment:
+        CHECKPOINT_API_KEY: "{{ checkpoint_api_key }}"
       register: domain_result
       changed_when: false
       failed_when: false
@@ -66,9 +98,13 @@
     - name: Sanitize Check Point command output
       ansible.builtin.set_fact:
         domain_stdout_safe: >-
-          {{ domain_result.stdout | default('') | replace(checkpoint_api_key, '********') }}
+          {{ (domain_result.stdout | default('') | replace(checkpoint_api_key, '********'))
+             if checkpoint_api_key | length > 0
+             else (domain_result.stdout | default('')) }}
         domain_stderr_safe: >-
-          {{ domain_result.stderr | default('') | replace(checkpoint_api_key, '********') }}
+          {{ (domain_result.stderr | default('') | replace(checkpoint_api_key, '********'))
+             if checkpoint_api_key | length > 0
+             else (domain_result.stderr | default('')) }}
       no_log: true
 
     - name: Report Check Point command failure safely
@@ -76,6 +112,7 @@
         msg: |-
           mgmt_cli failed on {{ inventory_hostname }}.
           Return code: {{ domain_result.rc | default('unknown') }}
+          Diagnosis: {% if domain_result.rc | default(1) | int == 90 %}Check Point profile was not found at /etc/profile.d/CP.sh or /etc/profile.{% elif domain_result.rc | default(1) | int == 91 %}CHECKPOINT_API_KEY is empty; verify the custom AWX credential is attached and injects this environment variable.{% elif domain_result.rc | default(1) | int == 92 %}mgmt_cli was not found after loading the Check Point profile; verify the Check Point installation and FWDIR.{% elif domain_result.rc | default(1) | int == 93 %}The Check Point profile was found but could not be loaded.{% else %}mgmt_cli executed but returned a failure; review the sanitized output below.{% endif %}
           Standard error: {{ domain_stderr_safe | default('(empty)', true) }}
           Standard output: {{ domain_stdout_safe | default('(empty)', true) }}
       when: domain_result.rc | default(1) | int != 0
