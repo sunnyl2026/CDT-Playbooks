@@ -52,31 +52,9 @@
           exit 91
         fi
 
-        checkpoint_profile=""
-        for profile in /etc/profile.d/CP.sh /etc/profile; do
-          if [ -r "$profile" ]; then
-            checkpoint_profile="$profile"
-            break
-          fi
-        done
-
-        if [ -z "$checkpoint_profile" ]; then
-          echo "CHECKPOINT_DIAG: PROFILE_NOT_FOUND" >&2
-          exit 90
-        fi
-
-        if ! source "$checkpoint_profile" 1>&2; then
-          echo "CHECKPOINT_DIAG: PROFILE_LOAD_FAILED: $checkpoint_profile" >&2
-          exit 93
-        fi
-
-        mgmt_cli_path="$(command -v mgmt_cli 2>/dev/null || true)"
-        if [ -z "$mgmt_cli_path" ] && [ -n "${FWDIR:-}" ] && [ -x "$FWDIR/bin/mgmt_cli" ]; then
-          mgmt_cli_path="$FWDIR/bin/mgmt_cli"
-        fi
-
-        if [ -z "$mgmt_cli_path" ]; then
-          echo "CHECKPOINT_DIAG: MGMT_CLI_NOT_FOUND after loading $checkpoint_profile" >&2
+        mgmt_cli_path="/opt/CPshrd-R82/bin/mgmt_cli"
+        if [ ! -x "$mgmt_cli_path" ]; then
+          echo "CHECKPOINT_DIAG: MGMT_CLI_NOT_FOUND: $mgmt_cli_path" >&2
           exit 92
         fi
 
@@ -90,6 +68,10 @@
         executable: /bin/bash
       environment:
         CHECKPOINT_API_KEY: "{{ checkpoint_api_key }}"
+        FWDIR: "/opt/CPmds-R82"
+        CPDIR: "/opt/CPshrd-R82"
+        MDSDIR: "/opt/CPmds-R82"
+        PATH: "/opt/CPshrd-R82/bin:/opt/CPmds-R82/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
       register: domain_result
       changed_when: false
       failed_when: false
@@ -112,7 +94,7 @@
         msg: |-
           mgmt_cli failed on {{ inventory_hostname }}.
           Return code: {{ domain_result.rc | default('unknown') }}
-          Diagnosis: {% if domain_result.rc | default(1) | int == 90 %}Check Point profile was not found at /etc/profile.d/CP.sh or /etc/profile.{% elif domain_result.rc | default(1) | int == 91 %}CHECKPOINT_API_KEY is empty; verify the custom AWX credential is attached and injects this environment variable.{% elif domain_result.rc | default(1) | int == 92 %}mgmt_cli was not found after loading the Check Point profile; verify the Check Point installation and FWDIR.{% elif domain_result.rc | default(1) | int == 93 %}The Check Point profile was found but could not be loaded.{% else %}mgmt_cli executed but returned a failure; review the sanitized output below.{% endif %}
+          Diagnosis: {% if domain_result.rc | default(1) | int == 91 %}CHECKPOINT_API_KEY is empty; verify the custom AWX credential is attached and injects this environment variable.{% elif domain_result.rc | default(1) | int == 92 %}mgmt_cli was not found or is not executable at /opt/CPshrd-R82/bin/mgmt_cli.{% else %}mgmt_cli executed but returned a failure; review the sanitized output below.{% endif %}
           Standard error: {{ domain_stderr_safe | default('(empty)', true) }}
           Standard output: {{ domain_stdout_safe | default('(empty)', true) }}
       when: domain_result.rc | default(1) | int != 0
