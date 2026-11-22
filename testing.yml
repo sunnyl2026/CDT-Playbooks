@@ -1,3 +1,4 @@
+---
 - name: Check AWX execution environment
   ansible.builtin.shell: |
     echo "USER=$(whoami)"
