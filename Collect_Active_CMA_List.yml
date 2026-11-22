@@ -275,14 +275,24 @@
                  | rejectattr('variable', 'equalto', 'change_id')
                  | rejectattr('variable', 'equalto', 'target_cmas')
                  | list }}
+            cma_choices: []
+
+        - name: Build separate CMA survey choices
+          ansible.builtin.set_fact:
             cma_choices: >-
-              {%- set ns = namespace(choices=[]) -%}
-              {%- for item in cma_list | sort(attribute='cma') -%}
-              {%- set ns.choices = ns.choices + [
-                item.cma ~ '(' ~ item.ip ~ ') == ' ~ item.mds
-              ] -%}
-              {%- endfor -%}
-              {{ ns.choices | unique | join('\n') }}
+              {{
+                cma_choices
+                + [
+                  item.cma ~ '(' ~ item.ip ~ ') == ' ~ item.mds
+                ]
+              }}
+          loop: "{{ cma_list | sort(attribute='cma') }}"
+          loop_control:
+            label: "{{ item.cma }}"
+
+        - name: Remove duplicate CMA survey choices
+          ansible.builtin.set_fact:
+            cma_choices: "{{ cma_choices | unique | list }}"
 
         - name: Build updated survey
           ansible.builtin.set_fact:
@@ -344,4 +354,4 @@
             msg:
               - "Structured file: {{ inventory_root }}/{{ change_id }}/{{ change_id }}_active_cma_list.json"
               - "Updated next template ID: {{ next_template_id }}"
-              - "CMA choices: {{ cma_choices.split('\n') }}"
+              - "CMA choices: {{ cma_choices }}"
