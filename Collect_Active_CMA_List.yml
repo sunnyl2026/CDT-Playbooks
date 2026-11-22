@@ -1,0 +1,283 @@
+---
+- name: Collect active CMA inventory
+  hosts: "{{ mds_host | default('MDS21') }}"
+  gather_facts: false
+  become: true
+
+  vars:
+    # ================================================================
+    # EASY-TO-CHANGE SETTINGS
+    # ================================================================
+    smtp_server: "172.20.50.29"
+    smtp_from: "donotreply@hkps.cp"
+    email_subject: "DoNotReply: Active CMA List Requested by {{ requestor_name }}"
+    email_content: |-
+      This is a system generated email from MDS Host MDS21
+      {{ execution_timestamp }}
+
+      CMA list as attached
+
+    next_template_id: 30
+
+    # CHECKPOINT_API_KEY and AWX_API_TOKEN are supplied by custom credentials
+    # attached to this AWX job template. Neither secret is hard-coded here.
+    checkpoint_api_key: "{{ lookup('ansible.builtin.env', 'CHECKPOINT_API_KEY') }}"
+    awx_host: "http://172.20.50.28:30080"
+
+    # Portability settings
+    checkpoint_domain: "System Data"
+    inventory_root: "/var/log/CDT_Project/Inventory"
+    report_only_change_id: "CMA_Report_ONLY"
+    awx_validate_certs: true
+
+  tasks:
+    - name: Validate required input
+      ansible.builtin.assert:
+        that:
+          - change_id is defined
+          - change_id | trim | length > 0
+          - change_id is match('^[A-Za-z0-9][A-Za-z0-9._-]*$')
+          - change_id not in ['.', '..']
+          - checkpoint_api_key | length > 0
+        fail_msg: >-
+          A valid change_id and checkpoint_api_key are required. change_id may
+          contain only letters, numbers, dots, underscores, and hyphens.
+      no_log: true
+
+    - name: Collect domain information from Check Point
+      ansible.builtin.command:
+        argv:
+          - mgmt_cli
+          - --api-key
+          - "{{ checkpoint_api_key }}"
+          - --domain
+          - "{{ checkpoint_domain }}"
+          - show
+          - domains
+          - details-level
+          - full
+          - --format
+          - json
+      register: domain_result
+      changed_when: false
+      no_log: true
+
+    - name: Initialize CMA data
+      ansible.builtin.set_fact:
+        domain_data: "{{ domain_result.stdout | from_json }}"
+        cma_list: []
+
+    - name: Build active CMA list
+      ansible.builtin.set_fact:
+        cma_list: >-
+          {{ cma_list + [{
+            'mds': item.1['multi-domain-server'],
+            'cma': item.1.name,
+            'ip': item.1['ipv4-address']
+          }] }}
+      loop: "{{ domain_data.objects | default([]) | subelements('servers', skip_missing=True) }}"
+      when: item.1.active | default(false) | bool
+      loop_control:
+        label: "{{ item.1.name | default('unknown CMA') }}"
+
+    - name: Sort and validate CMA list
+      ansible.builtin.set_fact:
+        cma_list: "{{ cma_list | sort(attribute='cma') | sort(attribute='mds') }}"
+
+    - name: Stop when no active CMA is found
+      ansible.builtin.assert:
+        that: cma_list | length > 0
+        fail_msg: "No active CMA was returned by the Check Point API."
+
+    - name: Get creation timestamp from MDS host
+      ansible.builtin.command: date "+%Y-%m-%d %H:%M:%S %Z"
+      register: timestamp_result
+      changed_when: false
+
+    - name: Save creation timestamp
+      ansible.builtin.set_fact:
+        execution_timestamp: "{{ timestamp_result.stdout }}"
+
+    # ----------------------------------------------------------------
+    # TASK 1: report-only request
+    # ----------------------------------------------------------------
+    - name: Create and email the report-only inventory
+      when: change_id == report_only_change_id
+      block:
+        - name: Validate report requestor details
+          ansible.builtin.assert:
+            that:
+              - requestor_name is defined
+              - requestor_name | trim | length > 0
+              - requestor_email is defined
+              - requestor_email is match('^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$')
+            fail_msg: "requestor_name and a valid requestor_email are required."
+
+        - name: Create report-only directory
+          ansible.builtin.file:
+            path: "{{ inventory_root }}/{{ report_only_change_id }}"
+            state: directory
+            mode: "0750"
+
+        - name: Create or overwrite CMA report
+          ansible.builtin.copy:
+            dest: "{{ inventory_root }}/{{ report_only_change_id }}/cma_inventory"
+            mode: "0640"
+            content: |
+              Creator: {{ requestor_name }}
+              Creation Time: {{ execution_timestamp }}
+
+              ==============================================================================
+              MDS Name                         CMA Name                         CMA IP
+              ==============================================================================
+              {% for item in cma_list %}
+              {{ "%-32s %-32s %s" | format(item.mds, item.cma, item.ip) }}
+              {% endfor %}
+
+        - name: Email CMA report
+          community.general.mail:
+            host: "{{ smtp_server }}"
+            port: 25
+            from: "{{ smtp_from }}"
+            to: "{{ requestor_email }}"
+            subject: "{{ email_subject }}"
+            body: "{{ email_content }}"
+            attach:
+              - "{{ inventory_root }}/{{ report_only_change_id }}/cma_inventory"
+
+        - name: Show report result
+          ansible.builtin.debug:
+            msg:
+              - "Report: {{ inventory_root }}/{{ report_only_change_id }}/cma_inventory"
+              - "Email sent to: {{ requestor_email }}"
+
+    # ----------------------------------------------------------------
+    # TASK 2: change-specific inventory and next-template survey
+    # ----------------------------------------------------------------
+    - name: Create change inventory and update the next template survey
+      when: change_id != report_only_change_id
+      block:
+        - name: Validate AWX API settings and injected token
+          ansible.builtin.assert:
+            that:
+              - awx_host | trim | length > 0
+              - lookup('ansible.builtin.env', 'AWX_API_TOKEN') | length > 0
+              - next_template_id | int > 0
+            fail_msg: >-
+              awx_host, an AWX_API_TOKEN credential, and a positive
+              next_template_id are required for Task 2.
+          no_log: true
+
+        - name: Build AWX API headers from the attached credential
+          ansible.builtin.set_fact:
+            awx_api_headers: >-
+              {{ dict([
+                ['Authorization', ['Bearer', lookup('ansible.builtin.env', 'AWX_API_TOKEN')] | join(' ')],
+                ['Accept', 'application/json']
+              ]) }}
+          no_log: true
+
+        - name: Create change directory
+          ansible.builtin.file:
+            path: "{{ inventory_root }}/{{ change_id }}"
+            state: directory
+            mode: "0750"
+
+        - name: Create or overwrite structured CMA file
+          ansible.builtin.copy:
+            dest: "{{ inventory_root }}/{{ change_id }}/{{ change_id }}_active_cma_list"
+            mode: "0640"
+            content: "{{ cma_list | to_nice_json(indent=2) }}\n"
+
+        - name: Read structured CMA file
+          ansible.builtin.slurp:
+            src: "{{ inventory_root }}/{{ change_id }}/{{ change_id }}_active_cma_list"
+          register: structured_cma_file
+
+        - name: Show structured CMA file in AWX output
+          ansible.builtin.debug:
+            msg: "{{ structured_cma_file.content | b64decode }}"
+
+        - name: Read existing survey from next template
+          ansible.builtin.uri:
+            url: "{{ awx_host | regex_replace('/+$', '') }}/api/v2/job_templates/{{ next_template_id }}/survey_spec/"
+            method: GET
+            headers: "{{ awx_api_headers }}"
+            validate_certs: "{{ awx_validate_certs }}"
+            return_content: true
+            status_code: 200
+          register: existing_survey
+          delegate_to: localhost
+          become: false
+          no_log: true
+
+        - name: Preserve existing survey questions
+          ansible.builtin.set_fact:
+            existing_questions: >-
+              {{ existing_survey.json.spec | default([])
+                 | rejectattr('variable', 'equalto', 'change_id')
+                 | rejectattr('variable', 'equalto', 'target_cmas')
+                 | list }}
+            cma_choices: "{{ cma_list | map(attribute='cma') | unique | sort | join('\n') }}"
+
+        - name: Build updated survey
+          ansible.builtin.set_fact:
+            updated_questions: >-
+              {{ existing_questions + [
+                {
+                  'question_name': 'Please Enter Your Change ID',
+                  'question_description': '',
+                  'required': true,
+                  'type': 'text',
+                  'variable': 'change_id',
+                  'default': change_id,
+                  'min': 1,
+                  'max': 128
+                },
+                {
+                  'question_name': 'Please Select Your Target CMA',
+                  'question_description': '',
+                  'required': true,
+                  'type': 'multiselect',
+                  'variable': 'target_cmas',
+                  'choices': cma_choices,
+                  'default': ''
+                }
+              ] }}
+
+        - name: Update next template survey
+          ansible.builtin.uri:
+            url: "{{ awx_host | regex_replace('/+$', '') }}/api/v2/job_templates/{{ next_template_id }}/survey_spec/"
+            method: POST
+            headers: "{{ awx_api_headers }}"
+            body_format: json
+            body:
+              name: "{{ existing_survey.json.name | default('') }}"
+              description: "{{ existing_survey.json.description | default('') }}"
+              spec: "{{ updated_questions }}"
+            validate_certs: "{{ awx_validate_certs }}"
+            status_code: [200, 201]
+          delegate_to: localhost
+          become: false
+          no_log: true
+
+        - name: Enable survey on next template
+          ansible.builtin.uri:
+            url: "{{ awx_host | regex_replace('/+$', '') }}/api/v2/job_templates/{{ next_template_id }}/"
+            method: PATCH
+            headers: "{{ awx_api_headers }}"
+            body_format: json
+            body:
+              survey_enabled: true
+            validate_certs: "{{ awx_validate_certs }}"
+            status_code: 200
+          delegate_to: localhost
+          become: false
+          no_log: true
+
+        - name: Show survey update result
+          ansible.builtin.debug:
+            msg:
+              - "Structured file: {{ inventory_root }}/{{ change_id }}/{{ change_id }}_active_cma_list"
+              - "Updated next template ID: {{ next_template_id }}"
+              - "CMA choices: {{ cma_choices.split('\n') }}"
