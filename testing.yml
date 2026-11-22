@@ -1,15 +1,21 @@
 ---
 - name: Check AWX execution environment
-  ansible.builtin.shell: |
-    echo "USER=$(whoami)"
-    echo "SHELL=$SHELL"
-    echo "FWDIR=$FWDIR"
-    echo "CPDIR=$CPDIR"
-    echo "MDSDIR=$MDSDIR"
-    command -v mgmt_cli || true
-  register: awx_env
-  changed_when: false
+  hosts: "{{ mds_host | default('MDS21', true) }}"
+  gather_facts: false
+  become: true
 
-- name: Show AWX execution environment
-  ansible.builtin.debug:
-    var: awx_env.stdout_lines
+  tasks:
+    - name: Check AWX execution environment
+      ansible.builtin.shell: |
+        echo "USER=$(whoami)"
+        echo "SHELL=$SHELL"
+        echo "FWDIR=$FWDIR"
+        echo "CPDIR=$CPDIR"
+        echo "MDSDIR=$MDSDIR"
+        command -v mgmt_cli || true
+      register: awx_env
+      changed_when: false
+
+    - name: Show AWX execution environment
+      ansible.builtin.debug:
+        var: awx_env.stdout_lines
