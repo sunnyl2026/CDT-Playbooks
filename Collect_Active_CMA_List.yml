@@ -275,7 +275,14 @@
                  | rejectattr('variable', 'equalto', 'change_id')
                  | rejectattr('variable', 'equalto', 'target_cmas')
                  | list }}
-            cma_choices: "{{ cma_list | map(attribute='cma') | unique | sort | join('\n') }}"
+            cma_choices: >-
+              {%- set ns = namespace(choices=[]) -%}
+              {%- for item in cma_list | sort(attribute='cma') -%}
+              {%- set ns.choices = ns.choices + [
+                item.cma ~ '(' ~ item.ip ~ ') == ' ~ item.mds
+              ] -%}
+              {%- endfor -%}
+              {{ ns.choices | unique | join('\n') }}
 
         - name: Build updated survey
           ansible.builtin.set_fact:
